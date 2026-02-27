@@ -2,6 +2,26 @@
 # TempMail 临时邮箱平台 - Docker Compose
 # 高并发架构: PostgreSQL + PgBouncer + Redis + Go API + Postfix
 # ============================================================
+#
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                          端口速查表                           ║
+# ╠══════════════╦════════════╦══════════════════════════════════╣
+# ║ 端口         ║  服务       ║ 说明                             ║
+# ╠══════════════╬════════════╬══════════════════════════════════╣
+# ║ 80  (对外)   ║ frontend   ║ 用户访问的 Web 界面                ║
+# ║ 8080(对外)   ║ api        ║ Go API（建议生产环境关闭对外）      ║
+# ║ 25  (对外)   ║ postfix    ║ SMTP 收信，必须对外开放            ║
+# ╠══════════════╬════════════╬══════════════════════════════════╣
+# ║ 5432(内部)   ║ postgres   ║ 数据库，仅容器内互通             ║
+# ║ 6432(内部)   ║ pgbouncer  ║ 连接池，仅容器内互通             ║
+# ║ 6379(内部)   ║ redis      ║ 缓存，仅容器内互通               ║
+# ╚══════════════╩════════════╩══════════════════════════════════╝
+#
+# ★ 想修改对外端口？格式是 "宿主机端口:容器内端口"
+#   只改冒号左边（宿主机端口），右边不要动。
+#   例如把 Web 改到 8888：  ports: ["8888:80"]
+#   但改了之后记得同步修改所有相关文件，详见各端口注释。
+#
 name: tempmail
 
 services:
@@ -98,6 +118,21 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
+      # ★ API 对外端口
+      # 格式："宿主机端口:容器内端口"，只改左边。
+      # 默认 8080 同时对外暴露，方便调试。
+      # 生产环境建议改为 "127.0.0.1:8080:8080"（仅本机访问，
+      # 浏览器通过 Nginx:80 代理过来，不需要直接暴露 8080）。
+      #
+      # 如果你把宿主机端口改掉（如改成 9090），需要同步修改：
+      #   ← 本文件中无其他地方引用宿主机 8080，容器间通信走内网
+      #   ← 容器内端口(右边 8080)由 .env 的 API_PORT 控制，
+      #      若要改容器内端口，需同时修改：
+      #        1. .env / .env.example 中的 API_PORT=xxxx
+      #        2. .env / .env.example 中的 API_DB_DSN（无关，但确认）
+      #        3. nginx/default.conf 中所有 proxy_pass http://api:8080 → api:xxxx
+      #        4. postfix/entrypoint.sh 中 curl http://api:8080 → api:xxxx
+      #        5. postfix/mail-receiver.py 中 API_URL 默认值 http://api:8080
       - "8080:8080"
     volumes:
       - ./data:/data
@@ -124,6 +159,14 @@ services:
     image: nginx:alpine
     restart: unless-stopped
     ports:
+      # ★ Web 界面对外端口（用户浏览器访问的入口）
+      # 格式："宿主机端口:容器内端口"，只改左边。
+      # 默认 80，如果 80 被占用可改为其他端口（如 8888）：
+      #   ports: ["8888:80"]
+      # 右边的容器内端口 80 由 nginx/default.conf 的 listen 80 决定，
+      # 若要改容器内端口，需同时修改：
+      #   1. nginx/default.conf 第 2 行的 listen 80 → listen xxxx
+      #   2. 本行右边的数字同步改成 xxxx
       - "80:80"
     volumes:
       - ./frontend:/usr/share/nginx/html:ro
@@ -140,6 +183,16 @@ services:
       dockerfile: postfix/Dockerfile
     restart: unless-stopped
     ports:
+      # ★ SMTP 收信端口（邮件投递的入口）
+      # 标准 SMTP 端口是 25，通常不建议修改，
+      # 因为其他邮件服务器（Gmail/Outlook 等）固定向 25 端口投信。
+      # 若你的服务商封锁了 25 端口入方向（常见于阿里云/腾讯云），
+      # 需要向服务商申请解封，而不是改端口。
+      #
+      # 如果确实需要改宿主机监听端口（只影响本机 telnet 测试用）：
+      #   ports: ["2525:25"]  → 宿主机 2525 映射容器内 25
+      # 注意：容器内 Postfix 始终监听 25，改的只是宿主机的映射。
+      # 外部 MX 记录仍然需要指向你服务器的公网 IP，端口保持 25。
       - "25:25"
     environment:
       DB_DSN: ${API_DB_DSN}

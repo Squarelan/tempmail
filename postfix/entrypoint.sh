@@ -19,6 +19,9 @@ echo "${SMTP_HOSTNAME:-mail.example.com}     OK" > /etc/postfix/virtual_domains
 cat > /usr/local/bin/sync-domains.sh << 'SCRIPT'
 #!/bin/bash
 # 从 API 获取域名列表并更新 Postfix 虚拟域名
+# ★ 注意：这里的 api:8080 是 Docker 内部通信地址。
+# 如果你修改了 API 容器内端口（.env 的 API_PORT），
+# 需要把下面的 8080 改成对应的新端口。
 DOMAINS=$(curl -sf http://api:8080/internal/domains 2>/dev/null || echo "")
 if [ -n "$DOMAINS" ]; then
     echo "$DOMAINS" | python3 -c "
