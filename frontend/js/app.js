@@ -7,12 +7,39 @@
 // ─── 配置 ───────────────────────────────────────────────────
 const API_BASE = '/api';
 const PUBLIC_BASE = '/public';
+const DEFAULT_SITE_TITLE = 'TempMail';
+const SITE_TITLE_SUFFIX = '临时邮箱平台';
+const DEFAULT_SITE_LOGO = '✉';
+const DEFAULT_SITE_SUBTITLE = '临时邮箱服务 · 安全隔离 · 按需分配';
+const DEFAULT_RESERVED_MAILBOX_ADDRESSES = `admin
+administrator
+root
+system
+support
+noreply
+no-reply
+no_reply
+notification
+notifications
+notify
+alerts
+mailer-daemon
+postmaster
+hostmaster
+webmaster
+security
+abuse
+daemon`;
 
 // ─── 状态 ───────────────────────────────────────────────────
 const state = {
   apiKey:    localStorage.getItem('tm_apikey') || '',
   account:   JSON.parse(localStorage.getItem('tm_account') || 'null'),
-  theme:     localStorage.getItem('tm_theme') || 'light',
+  theme:     localStorage.getItem('tm_theme') || 'system',
+  siteTitle: localStorage.getItem('tm_site_title') || DEFAULT_SITE_TITLE,
+  siteLogo: localStorage.getItem('tm_site_logo') || DEFAULT_SITE_LOGO,
+  siteSubtitle: localStorage.getItem('tm_site_subtitle') || DEFAULT_SITE_SUBTITLE,
+  publicSettings: null,
   page:      'dashboard',
   // 当前邮箱
   currentMailbox: null,
@@ -20,6 +47,10 @@ const state = {
   // 缓存
   mailboxes: [],
   emails:    [],
+  adminDomains: [],
+  bulkSelections: {},
+  bulkVisibleIds: {},
+  bulkActionConfigs: {},
 };
 
 // ─── 工具函数 ───────────────────────────────────────────────
@@ -41,6 +72,64 @@ function toast(msg, type = 'info') {
 
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function normalizeDomainInput(domain) {
+  return String(domain || '').trim().toLowerCase().replace(/\.$/, '');
+}
+
+function isWildcardDomainPattern(domain) {
+  return normalizeDomainInput(domain).startsWith('*.');
+}
+
+function getWildcardBaseDomain(domain) {
+  return normalizeDomainInput(domain).replace(/^\*\./, '');
+}
+
+function getWildcardDomainExample(domain) {
+  const base = getWildcardBaseDomain(domain);
+  return base ? `inbox.${base}` : 'inbox.example.com';
+}
+
+function getWildcardDeepExample(domain) {
+  const base = getWildcardBaseDomain(domain);
+  return base ? `team.mail.${base}` : 'team.mail.example.com';
+}
+
+function buildWildcardCustomDomain(rule, rawInput) {
+  const base = getWildcardBaseDomain(rule);
+  const normalized = normalizeDomainInput(rawInput);
+  if (!base || !normalized) return '';
+  if (normalized === base || normalized.endsWith(`.${base}`)) return normalized;
+  return `${normalized}.${base}`;
+}
+
+function splitManagedDomains(domains) {
+  const grouped = { exact: [], wildcard: [] };
+  for (const domain of (domains || [])) {
+    if (isWildcardDomainPattern(domain?.domain || domain)) grouped.wildcard.push(domain);
+    else grouped.exact.push(domain);
+  }
+  return grouped;
+}
+
+function renderWildcardExamplesHtml(domain) {
+  const primary = getWildcardDomainExample(domain);
+  const secondary = `也支持 ${getWildcardDeepExample(domain)}`;
+  return `
+    <div class="domain-example-stack domain-example-nowrap">
+      <code title="${escHtml(primary)}">${escHtml(primary)}</code>
+      <div class="domain-example-note" title="${escHtml(secondary)}">${escHtml(secondary)}</div>
+    </div>
+  `;
+}
+
+function renderDomainTypeHtml(domain) {
+  if (isWildcardDomainPattern(domain)) {
+    const base = getWildcardBaseDomain(domain);
+    return `<span class="badge badge-gold">通配子域</span><span class="domain-type-detail" title="匹配任意 *.${escHtml(base)}，不含根域">匹配任意 *.${escHtml(base)}，不含根域</span>`;
+  }
+  return `<span class="badge badge-gray">精确域名</span>`;
 }
 
 function formatDate(s) {
@@ -69,25 +158,328 @@ async function copyText(text) {
   }
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isTemporaryRequestStatus(status) {
+  return [429, 502, 503, 504].includes(Number(status));
+}
+
+function isTemporaryRequestError(error) {
+  const status = Number(error?.status || 0);
+  const message = String(error?.rawMessage || error?.message || '').toLowerCase();
+  return isTemporaryRequestStatus(status)
+    || message.includes('rate limit exceeded')
+    || message.includes('failed to fetch')
+    || message.includes('networkerror')
+    || message.includes('service unavailable')
+    || message.includes('gateway timeout')
+    || message.includes('正在唤醒')
+    || message.includes('请稍候刷新');
+}
+
+function getTemporaryRequestMessage(error) {
+  if (!error) return '服务正在恢复中，请稍候再试。';
+  if (Number(error.status) === 429 || String(error?.rawMessage || error?.message || '').toLowerCase().includes('rate limit exceeded')) {
+    return '服务刚恢复或短时间请求过多，请稍候几秒再试。';
+  }
+  return '服务正在唤醒或临时不可用，请稍候几秒再试。';
+}
+
+function getDisplayErrorMessage(error) {
+  if (!error) return '请求失败';
+  if (isTemporaryRequestError(error)) {
+    return getTemporaryRequestMessage(error);
+  }
+  return String(error.message || error.rawMessage || '请求失败');
+}
+
+function getSiteTitle() {
+  const title = state.publicSettings?.site_title || state.siteTitle || DEFAULT_SITE_TITLE;
+  return String(title).trim() || DEFAULT_SITE_TITLE;
+}
+
+function getSiteLogo() {
+  const logo = state.publicSettings?.site_logo || state.siteLogo || DEFAULT_SITE_LOGO;
+  return String(logo).trim() || DEFAULT_SITE_LOGO;
+}
+
+function getSiteSubtitle() {
+  const subtitle = state.publicSettings?.site_subtitle || state.siteSubtitle || DEFAULT_SITE_SUBTITLE;
+  return String(subtitle).trim() || DEFAULT_SITE_SUBTITLE;
+}
+
+function getBulkSelection(key) {
+  if (!state.bulkSelections[key]) {
+    state.bulkSelections[key] = new Set();
+  }
+  return state.bulkSelections[key];
+}
+
+function setBulkVisibleIds(key, ids) {
+  const visible = (ids || []).map(id => String(id));
+  state.bulkVisibleIds[key] = visible;
+  const visibleSet = new Set(visible);
+  const selection = getBulkSelection(key);
+  for (const id of [...selection]) {
+    if (!visibleSet.has(id)) selection.delete(id);
+  }
+}
+
+function getBulkSelectedIds(key) {
+  const selection = getBulkSelection(key);
+  const visible = state.bulkVisibleIds[key] || [];
+  return visible.filter(id => selection.has(id));
+}
+
+function isBulkSelected(key, id) {
+  return getBulkSelection(key).has(String(id));
+}
+
+window.toggleBulkSelection = function(key, id, checked) {
+  const selection = getBulkSelection(key);
+  const normalizedId = String(id);
+  if (checked) selection.add(normalizedId);
+  else selection.delete(normalizedId);
+  updateBulkUI(key);
+};
+
+window.toggleBulkSelectAll = function(key, checked) {
+  const selection = getBulkSelection(key);
+  selection.clear();
+  if (checked) {
+    for (const id of state.bulkVisibleIds[key] || []) {
+      selection.add(String(id));
+    }
+  }
+  updateBulkUI(key);
+};
+
+window.clearBulkSelection = function(key) {
+  getBulkSelection(key).clear();
+  updateBulkUI(key);
+};
+
+window.invertBulkSelection = function(key) {
+  const visible = state.bulkVisibleIds[key] || [];
+  const selection = getBulkSelection(key);
+  const nextSelected = visible.filter(id => !selection.has(id));
+  selection.clear();
+  for (const id of nextSelected) {
+    selection.add(String(id));
+  }
+  updateBulkUI(key);
+};
+
+function getBulkActionSelectId(key) {
+  return `bulk-action-select-${String(key).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+}
+
+window.runSelectedBulkAction = async function(key) {
+  const selectEl = document.getElementById(getBulkActionSelectId(key));
+  const actionValue = selectEl?.value || '';
+  if (!actionValue) {
+    toast('请先选择批量操作', 'warn');
+    return;
+  }
+  const action = (state.bulkActionConfigs[key] || []).find(item => item.value === actionValue);
+  if (!action) {
+    toast('无效的批量操作', 'error');
+    return;
+  }
+  await action.run();
+  if (selectEl) selectEl.value = '';
+};
+
+function buildBulkToolbar({ key, itemLabel, actions = [], scopeHint = '当前仅对当前已加载列表生效，暂不支持跨页全选。' }) {
+  state.bulkActionConfigs[key] = actions;
+  const visibleIds = state.bulkVisibleIds[key] || [];
+  const selectedIds = getBulkSelectedIds(key);
+  const allSelected = visibleIds.length > 0 && selectedIds.length === visibleIds.length;
+  const selectId = getBulkActionSelectId(key);
+  return `
+    <div class="card" data-bulk-toolbar="${key}" data-bulk-item-label="${escHtml(itemLabel)}" style="margin-bottom:0.8rem;padding:0.8rem 1rem">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:0.8rem;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:0.8rem;flex-wrap:wrap;font-size:0.82rem;color:var(--text-secondary)">
+          <label style="display:flex;align-items:center;gap:0.45rem;cursor:pointer">
+            <input type="checkbox" data-bulk-role="select-all" ${allSelected ? 'checked' : ''} onchange="toggleBulkSelectAll('${key}', this.checked)">
+            <span>全选当前列表</span>
+          </label>
+          <button class="btn btn-ghost btn-sm" onclick="invertBulkSelection('${key}')">反选</button>
+          <span data-bulk-role="summary">已选 <strong>${selectedIds.length}</strong> / ${visibleIds.length} 个${escHtml(itemLabel)}</span>
+          <button class="btn btn-ghost btn-sm" data-bulk-role="clear" style="${selectedIds.length > 0 ? '' : 'display:none'}" onclick="clearBulkSelection('${key}')">清空选择</button>
+        </div>
+        <div style="display:flex;gap:0.45rem;flex-wrap:wrap">
+          <select class="form-input" id="${selectId}" style="min-width:190px">
+            <option value="">选择批量操作…</option>
+            ${actions.map(action => `
+              <option value="${escHtml(action.value)}">${escHtml(action.label)}</option>
+            `).join('')}
+          </select>
+          <button class="btn btn-primary btn-sm" data-bulk-role="execute" ${selectedIds.length === 0 || actions.length === 0 ? 'disabled' : ''} onclick="runSelectedBulkAction('${key}')">执行</button>
+        </div>
+      </div>
+      <div class="form-hint" style="margin-top:0.55rem">${escHtml(scopeHint)}</div>
+    </div>
+  `;
+}
+
+function updateBulkUI(key) {
+  const visibleIds = state.bulkVisibleIds[key] || [];
+  const selectedIds = getBulkSelectedIds(key);
+  const selectedSet = new Set(selectedIds.map(String));
+  const allSelected = visibleIds.length > 0 && selectedIds.length === visibleIds.length;
+
+  document.querySelectorAll(`[data-bulk-key="${key}"][data-bulk-id]`).forEach(input => {
+    const id = String(input.getAttribute('data-bulk-id') || '');
+    input.checked = selectedSet.has(id);
+  });
+
+  document.querySelectorAll(`[data-bulk-toolbar="${key}"]`).forEach(toolbar => {
+    const selectAll = toolbar.querySelector('[data-bulk-role="select-all"]');
+    if (selectAll) selectAll.checked = allSelected;
+
+    const summary = toolbar.querySelector('[data-bulk-role="summary"]');
+    if (summary) {
+      const itemLabel = toolbar.getAttribute('data-bulk-item-label') || '';
+      summary.innerHTML = `已选 <strong>${selectedIds.length}</strong> / ${visibleIds.length} 个${itemLabel}`;
+    }
+
+    const clearBtn = toolbar.querySelector('[data-bulk-role="clear"]');
+    if (clearBtn) clearBtn.style.display = selectedIds.length > 0 ? '' : 'none';
+
+    const executeBtn = toolbar.querySelector('[data-bulk-role="execute"]');
+    if (executeBtn) executeBtn.disabled = selectedIds.length === 0 || !(state.bulkActionConfigs[key] || []).length;
+  });
+}
+
+async function runBulkDelete({ selectionKey, itemLabel, onDelete, onDone }) {
+  const ids = getBulkSelectedIds(selectionKey);
+  if (!ids.length) {
+    toast(`请先选择要删除的${itemLabel}`, 'warn');
+    return;
+  }
+  showModal(`批量删除${itemLabel}`, `<p>确定删除选中的 <strong>${ids.length}</strong> 个${itemLabel}？<br><span style="font-size:0.8rem;color:var(--clr-danger)">此操作不可恢复。</span></p>`, async () => {
+    let success = 0;
+    const failed = [];
+    for (const id of ids) {
+      try {
+        await onDelete(id);
+        success += 1;
+      } catch (e) {
+        failed.push({ id, error: e });
+      }
+    }
+    getBulkSelection(selectionKey).clear();
+    if (success > 0) {
+      toast(`已删除 ${success} 个${itemLabel}`, 'success');
+    }
+    if (failed.length > 0) {
+      toast(`${failed.length} 个${itemLabel}删除失败`, 'warn');
+    }
+    if (onDone) await onDone({ success, failed });
+  });
+}
+
+function getPermanentMailboxUsage(mailboxes = state.mailboxes) {
+  return (mailboxes || []).filter(mb => mb.is_permanent).length;
+}
+
+function getPermanentMailboxQuota(account = state.account) {
+  if (account?.is_admin) return Infinity;
+  const quota = Number(account?.permanent_mailbox_quota ?? 0);
+  return Number.isFinite(quota) && quota > 0 ? quota : 0;
+}
+
+function getPermanentMailboxRemaining(mailboxes = state.mailboxes, account = state.account) {
+  const quota = getPermanentMailboxQuota(account);
+  if (!Number.isFinite(quota)) return Infinity;
+  return Math.max(quota - getPermanentMailboxUsage(mailboxes), 0);
+}
+
+function applySiteBranding(siteTitle = getSiteTitle(), siteLogo = getSiteLogo(), siteSubtitle = getSiteSubtitle()) {
+  const normalizedTitle = String(siteTitle || DEFAULT_SITE_TITLE).trim() || DEFAULT_SITE_TITLE;
+  const normalizedLogo = String(siteLogo || DEFAULT_SITE_LOGO).trim() || DEFAULT_SITE_LOGO;
+  const normalizedSubtitle = String(siteSubtitle || DEFAULT_SITE_SUBTITLE).trim() || DEFAULT_SITE_SUBTITLE;
+  state.siteTitle = normalizedTitle;
+  state.siteLogo = normalizedLogo;
+  state.siteSubtitle = normalizedSubtitle;
+  localStorage.setItem('tm_site_title', normalizedTitle);
+  localStorage.setItem('tm_site_logo', normalizedLogo);
+  localStorage.setItem('tm_site_subtitle', normalizedSubtitle);
+  document.title = `${normalizedTitle} — ${SITE_TITLE_SUFFIX}`;
+  document.querySelectorAll('[data-site-title]').forEach(node => {
+    node.textContent = normalizedTitle;
+  });
+  document.querySelectorAll('[data-site-logo]').forEach(node => {
+    node.textContent = normalizedLogo;
+  });
+  document.querySelectorAll('[data-site-subtitle]').forEach(node => {
+    node.textContent = normalizedSubtitle;
+  });
+}
+
 // ─── API 客户端 ─────────────────────────────────────────────
 async function apiFetch(path, opts = {}) {
+  const method = String(opts.method || 'GET').toUpperCase();
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
-  if (state.apiKey) headers['Authorization'] = `Bearer ${state.apiKey}`;
-  const res = await fetch(path, { ...opts, headers });
-  let data;
-  try { data = await res.json(); } catch { data = {}; }
-  if (!res.ok) {
-    const errMsg = data.error || data.message || `HTTP ${res.status}`;
-    throw new Error(errMsg);
+  const shouldAttachAuth = opts.auth !== false;
+  if (shouldAttachAuth && state.apiKey) headers['Authorization'] = `Bearer ${state.apiKey}`;
+
+  const fetchOpts = { ...opts, method, headers };
+  delete fetchOpts.auth;
+  delete fetchOpts.retries;
+  delete fetchOpts.retry;
+
+  const retryable = opts.retry !== false && (method === 'GET' || method === 'HEAD');
+  const maxRetries = Number.isInteger(opts.retries) ? Math.max(opts.retries, 0) : (retryable ? 2 : 0);
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(path, fetchOpts);
+      let data;
+      try { data = await res.json(); } catch { data = {}; }
+      if (!res.ok) {
+        const rawMessage = data.error || data.message || `HTTP ${res.status}`;
+        const error = new Error(isTemporaryRequestStatus(res.status) ? getTemporaryRequestMessage({ status: res.status, rawMessage }) : rawMessage);
+        error.status = res.status;
+        error.rawMessage = rawMessage;
+        error.response = data;
+
+        if (attempt < maxRetries && isTemporaryRequestStatus(res.status)) {
+          const retryAfter = Number(res.headers.get('Retry-After') || '');
+          const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter * 1000
+            : 900 * (attempt + 1);
+          await sleep(waitMs);
+          continue;
+        }
+        throw error;
+      }
+      return data;
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err || '请求失败'));
+      const temporary = isTemporaryRequestError(error);
+      if (attempt < maxRetries && retryable && temporary) {
+        await sleep(900 * (attempt + 1));
+        continue;
+      }
+      if (temporary) {
+        error.message = getTemporaryRequestMessage(error);
+      }
+      throw error;
+    }
   }
-  return data;
+
+  throw new Error('请求失败');
 }
 
 const api = {
   // 公共
-  publicSettings: () => fetch(PUBLIC_BASE + '/settings').then(r => r.json()),
-  publicStats:     () => fetch(PUBLIC_BASE + '/stats').then(r => r.json()),
-  register: body  => apiFetch(PUBLIC_BASE + '/register', { method: 'POST', body: JSON.stringify(body) }),
+  publicSettings: () => apiFetch(PUBLIC_BASE + '/settings', { auth: false }),
+  publicStats:     () => apiFetch(PUBLIC_BASE + '/stats', { auth: false }),
+  register: body  => apiFetch(PUBLIC_BASE + '/register', { method: 'POST', body: JSON.stringify(body), auth: false }),
 
   // 账户
   me:              () => apiFetch(API_BASE + '/me'),
@@ -99,7 +491,7 @@ const api = {
   // 轮询域名状态（任意已登录用户，不需要管理员权限）
   getDomainStatus: id => apiFetch(API_BASE + '/domains/' + id + '/status'),
   // 邮箱 → 解包 {data:[...]}
-  createMailbox:   (body) => apiFetch(API_BASE + '/mailboxes', { method: 'POST', body: JSON.stringify(body || {}) }).then(d => d.mailbox || d),
+  createMailbox:   (body) => apiFetch(API_BASE + '/mailboxes', { method: 'POST', body: JSON.stringify(body || {}) }),
   listMailboxes:   () => apiFetch(API_BASE + '/mailboxes').then(d => Array.isArray(d) ? d : (d.data || [])),
   deleteMailbox: id  => apiFetch(API_BASE + '/mailboxes/' + id, { method: 'DELETE' }),
   // 邮件 → 解包 {data:[...]}
@@ -111,6 +503,13 @@ const api = {
     listAccounts:  (page=1,size=50) => apiFetch(API_BASE + '/admin/accounts?page='+page+'&size='+size).then(d => Array.isArray(d) ? d : (d.data || [])),
     createAccount: body => apiFetch(API_BASE + '/admin/accounts', { method: 'POST', body: JSON.stringify(body) }),
     deleteAccount: id   => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'DELETE' }),
+    toggleAccountAdmin: (id, is_admin) => apiFetch(API_BASE + '/admin/accounts/' + id + '/admin', { method: 'PUT', body: JSON.stringify({ is_admin }) }),
+    setAccountQuota: (id, permanent_mailbox_quota) => apiFetch(API_BASE + '/admin/accounts/' + id + '/quota', { method: 'PUT', body: JSON.stringify({ permanent_mailbox_quota }) }),
+    listCatchallMailboxes: (page=1,size=100) => apiFetch(API_BASE + '/admin/catchall/mailboxes?page='+page+'&size='+size).then(d => Array.isArray(d) ? d : (d.data || [])),
+    deleteCatchallMailbox: id => apiFetch(API_BASE + '/admin/catchall/mailboxes/' + id, { method: 'DELETE' }),
+    listCatchallEmails: mid => apiFetch(API_BASE + '/admin/catchall/mailboxes/' + mid + '/emails').then(d => Array.isArray(d) ? d : (d.data || [])),
+    getCatchallEmail: (mid, eid) => apiFetch(API_BASE + '/admin/catchall/mailboxes/' + mid + '/emails/' + eid).then(d => d.email || d),
+    deleteCatchallEmail: (mid, eid) => apiFetch(API_BASE + '/admin/catchall/mailboxes/' + mid + '/emails/' + eid, { method: 'DELETE' }),
     addDomain:   body => apiFetch(API_BASE + '/admin/domains', { method: 'POST', body: JSON.stringify(body) }),
     deleteDomain:  id => apiFetch(API_BASE + '/admin/domains/' + id, { method: 'DELETE' }),
     toggleDomain:  (id, active) => apiFetch(API_BASE + '/admin/domains/' + id + '/toggle', { method: 'PUT', body: JSON.stringify({ active }) }),
@@ -122,13 +521,79 @@ const api = {
   },
 };
 
+async function loadPublicSettings(force = false) {
+  if (!force && state.publicSettings) {
+    applySiteBranding(
+      state.publicSettings.site_title,
+      state.publicSettings.site_logo,
+      state.publicSettings.site_subtitle,
+    );
+    return state.publicSettings;
+  }
+  try {
+    const settings = await api.publicSettings();
+    state.publicSettings = settings || {};
+    applySiteBranding(
+      state.publicSettings.site_title,
+      state.publicSettings.site_logo,
+      state.publicSettings.site_subtitle,
+    );
+    return state.publicSettings;
+  } catch {
+    state.publicSettings = state.publicSettings || {};
+    applySiteBranding();
+    return state.publicSettings;
+  }
+}
+
 // ─── 主题 ────────────────────────────────────────────────────
-function applyTheme(t) {
-  document.documentElement.dataset.theme = t;
-  state.theme = t;
-  localStorage.setItem('tm_theme', t);
-  const btn = $('btn-theme');
-  if (btn) btn.textContent = t === 'dark' ? '☀ 浅色' : '☾ 深色';
+const themeMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+const THEME_ORDER = ['system', 'light', 'dark'];
+
+function getEffectiveTheme(mode = state.theme) {
+  if (mode === 'dark') return 'dark';
+  if (mode === 'light') return 'light';
+  return themeMedia && themeMedia.matches ? 'dark' : 'light';
+}
+
+function getThemeButtonLabel(mode = state.theme) {
+  switch (mode) {
+    case 'dark': return '☾ 深色模式';
+    case 'light': return '☀ 浅色模式';
+    default: return '◐ 跟随系统';
+  }
+}
+
+function getThemeButtonTitle(mode = state.theme) {
+  const effective = getEffectiveTheme(mode) === 'dark' ? '深色' : '浅色';
+  return `当前主题：${getThemeButtonLabel(mode).replace(/^[^\s]+\s*/, '')}（实际生效：${effective}）\n点击可切换为下一种模式`;
+}
+
+function refreshThemeButton() {
+  document.querySelectorAll('[data-role="theme-toggle"]').forEach(btn => {
+    btn.textContent = getThemeButtonLabel(state.theme);
+    btn.title = getThemeButtonTitle(state.theme);
+  });
+}
+
+function applyTheme(mode, { persist = true } = {}) {
+  const effective = getEffectiveTheme(mode);
+  document.documentElement.dataset.theme = effective;
+  document.documentElement.style.colorScheme = effective;
+  state.theme = mode;
+  if (persist) localStorage.setItem('tm_theme', mode);
+  refreshThemeButton();
+}
+
+if (themeMedia) {
+  const syncSystemTheme = () => {
+    if (state.theme === 'system') applyTheme('system', { persist: false });
+  };
+  if (typeof themeMedia.addEventListener === 'function') {
+    themeMedia.addEventListener('change', syncSystemTheme);
+  } else if (typeof themeMedia.addListener === 'function') {
+    themeMedia.addListener(syncSystemTheme);
+  }
 }
 
 // ─── 认证 ─────────────────────────────────────────────────────
@@ -143,12 +608,19 @@ async function tryLogin(key) {
     navigate('dashboard');
     toast(`欢迎回来，${acct.username || '用户'}`, 'success');
   } catch (e) {
-    state.apiKey = '';
-    toast('API Key 无效: ' + e.message, 'error');
+    const isAuthFailure = [401, 403].includes(Number(e?.status || 0));
+    if (isAuthFailure) {
+      state.apiKey = '';
+      toast('API Key 无效: ' + getDisplayErrorMessage(e), 'error');
+      return;
+    }
+    toast('登录失败: ' + getDisplayErrorMessage(e), isTemporaryRequestError(e) ? 'warn' : 'error');
   }
 }
 
 function logout() {
+  clearInboxPoller();
+  clearPendingDomainPoller();
   state.apiKey = '';
   state.account = null;
   localStorage.removeItem('tm_apikey');
@@ -161,6 +633,7 @@ function navigate(page, params = {}) {
   closeSidebar();
   // 离开收件箱时停止自动刷新
   if (page !== 'inbox') clearInboxPoller();
+  if (!['domains-guide', 'admin-domains'].includes(page)) clearPendingDomainPoller();
   state.page = page;
   Object.assign(state, params);
   renderPage(page);
@@ -172,27 +645,38 @@ function navigate(page, params = {}) {
 
 // ─── 布局渲染 ──────────────────────────────────────────────────
 function showAuthPage() {
+  clearInboxPoller();
+  clearPendingDomainPoller();
   $('app').innerHTML = '';
   $('app').appendChild(buildAuthPage());
+  applyTheme(state.theme, { persist: false });
+  applySiteBranding();
   renderLoginForm();
 }
 
 function showMainLayout() {
   $('app').innerHTML = '';
   $('app').appendChild(buildMainLayout());
-  applyTheme(state.theme);
+  applyTheme(state.theme, { persist: false });
+  applySiteBranding();
 }
 
 function buildAuthPage() {
   const wrap = el('div', null);
   wrap.id = 'auth-page';
 
+  const quickActions = el('div', 'auth-floating-actions');
+  quickActions.innerHTML = `
+    <button class="btn-theme auth-theme-btn" id="btn-theme-auth" data-role="theme-toggle" onclick="toggleTheme()">${getThemeButtonLabel(state.theme)}</button>
+  `;
+  wrap.appendChild(quickActions);
+
   const card = el('div', 'auth-card');
   card.innerHTML = `
     <div class="auth-logo">
-      <div class="logo-icon">✉</div>
-      <h1>TempMail</h1>
-      <p>临时邮箱服务 · 安全隔离 · 按需分配</p>
+      <div class="logo-icon" data-site-logo>${escHtml(getSiteLogo())}</div>
+      <h1 data-site-title>${escHtml(getSiteTitle())}</h1>
+      <p data-site-subtitle>${escHtml(getSiteSubtitle())}</p>
     </div>
     <div class="auth-tabs">
       <button class="auth-tab active" id="tab-login" onclick="switchAuthTab('login')">使用 API Key 登录</button>
@@ -203,7 +687,7 @@ function buildAuthPage() {
   wrap.appendChild(card);
 
   // 检查是否允许注册
-  api.publicSettings().then(d => {
+  loadPublicSettings().then(d => {
     const open = d.registration_open === 'true' || d.registration_open === true;
     if (!open) {
       const regTab = card.querySelector('#tab-reg');
@@ -306,10 +790,10 @@ function buildMainLayout() {
     <div class="sidebar-backdrop" id="sidebar-backdrop" onclick="closeSidebar()"></div>
     <nav class="sidebar" id="main-sidebar">
       <div class="sidebar-logo">
-        <div class="logo-mark">✉</div>
+        <div class="logo-mark" data-site-logo>${escHtml(getSiteLogo())}</div>
         <div>
-          <span>TempMail</span>
-          <small>临时邮箱服务</small>
+          <span data-site-title>${escHtml(getSiteTitle())}</span>
+          <small data-site-subtitle>${escHtml(getSiteSubtitle())}</small>
         </div>
       </div>
       <div class="sidebar-nav">
@@ -328,6 +812,9 @@ function buildMainLayout() {
         <button class="nav-item" data-page="admin-accounts" onclick="navigate('admin-accounts')">
           <span class="nav-icon">👥</span><span>账户管理</span>
         </button>
+        <button class="nav-item" data-page="admin-catchall" onclick="navigate('admin-catchall')">
+          <span class="nav-icon">📥</span><span>Catch-all 收件箱</span>
+        </button>
         <button class="nav-item" data-page="admin-domains" onclick="navigate('admin-domains')">
           <span class="nav-icon">🌐</span><span>域名管理</span>
         </button>
@@ -345,7 +832,7 @@ function buildMainLayout() {
           </div>
         </div>
         <button class="btn-logout" onclick="logout()">⏏ 退出登录</button>
-        <button class="btn-theme" id="btn-theme" onclick="toggleTheme()">${state.theme==='dark'?'☀ 浅色':'☾ 深色'}</button>
+        <button class="btn-theme" id="btn-theme" data-role="theme-toggle" onclick="toggleTheme()">${getThemeButtonLabel(state.theme)}</button>
       </div>
     </nav>
     <div class="content" id="content-area">
@@ -366,7 +853,9 @@ function buildMainLayout() {
 }
 
 window.toggleTheme = function() {
-  applyTheme(state.theme === 'dark' ? 'light' : 'dark');
+  const idx = THEME_ORDER.indexOf(state.theme);
+  const nextTheme = THEME_ORDER[(idx + 1) % THEME_ORDER.length];
+  applyTheme(nextTheme);
 };
 window.navigate = navigate;
 window.logout   = logout;
@@ -406,6 +895,7 @@ async function renderPage(page) {
     'email-view':     ['邮件内容', ''],
     'domains-guide':  ['域名列表 & 添加指南', '查看可用域名并了解如何添加新域名'],
     'admin-accounts': ['账户管理', '创建和管理用户账户'],
+    'admin-catchall': ['Catch-all 收件箱', '查看未预创建地址收到的邮件'],
     'admin-domains':  ['域名管理', '管理域名池'],
     'admin-settings': ['系统设置', ''],
     'apikey-show':    ['API Key', ''],
@@ -423,6 +913,7 @@ async function renderPage(page) {
       case 'email-view':     await renderEmailView(container); break;
       case 'domains-guide':  await renderDomainsGuide(container); break;
       case 'admin-accounts': await renderAdminAccounts(container); break;
+      case 'admin-catchall': await renderAdminCatchall(container); break;
       case 'admin-domains':  await renderAdminDomains(container); break;
       case 'admin-settings': await renderAdminSettings(container); break;
       case 'apikey-show':    renderApiKeyShow(container); break;
@@ -430,12 +921,31 @@ async function renderPage(page) {
       default: container.innerHTML = '<div class="page"><p>页面未找到</p></div>';
     }
   } catch(e) {
-    container.innerHTML = `<div style="padding:2rem;color:var(--clr-danger)">加载失败：${escHtml(e.message)}</div>`;
+    const msg = getDisplayErrorMessage(e);
+    if (isTemporaryRequestError(e)) {
+      container.innerHTML = `
+        <div class="card">
+          <div class="empty-state">
+            <span class="empty-icon">⏳</span>
+            <p>服务正在恢复中</p>
+            <p style="margin-top:0.5rem;font-size:0.82rem">${escHtml(msg)}</p>
+            <button class="btn btn-primary btn-sm" style="margin-top:1rem" onclick="retryCurrentPage()">重新加载</button>
+          </div>
+        </div>
+      `;
+      return;
+    }
+    container.innerHTML = `<div style="padding:2rem;color:var(--clr-danger)">加载失败：${escHtml(msg)}</div>`;
   }
 }
 
+window.retryCurrentPage = function() {
+  renderPage(state.page);
+};
+
 // ─── Dashboard ─────────────────────────────────────────────
 async function renderDashboard(container) {
+  const bulkKey = 'dashboard-mailboxes';
   const isAdmin = state.account?.is_admin;
   const [mailboxes, domains, statsData] = await Promise.all([
     api.listMailboxes(),
@@ -443,6 +953,7 @@ async function renderDashboard(container) {
     api.stats().catch(() => null),
   ]);
   state.mailboxes = mailboxes || [];
+  setBulkVisibleIds(bulkKey, state.mailboxes.map(mb => mb.id));
 
   const actions = $('topbar-actions');
   if (actions) {
@@ -456,9 +967,13 @@ async function renderDashboard(container) {
   const st     = statsData || {};
   const activeDomains  = (domains||[]).filter(d => d.is_active).length;
   const pendingDomains = (domains||[]).filter(d => d.status === 'pending').length;
+  const permanentUsed = getPermanentMailboxUsage(boxes);
+  const permanentQuota = getPermanentMailboxQuota(state.account);
+  const permanentRemaining = getPermanentMailboxRemaining(boxes, state.account);
 
   const statCards = [
     { label: '我的邮箱', value: boxes.length,                   note: '当前有效' },
+    { label: '永久邮箱', value: permanentUsed,                  note: Number.isFinite(permanentQuota) ? `剩余 ${permanentRemaining} / 总额 ${permanentQuota}` : '管理员无限制' },
     { label: '可用域名', value: activeDomains,                  note: `共 ${(domains||[]).length} 个` },
     { label: '收到邮件', value: st.total_emails ?? '—',         note: '全平台累计' },
     { label: '邮箱总量', value: st.total_mailboxes ?? '—',      note: `活跃 ${st.active_mailboxes ?? '—'} 个` },
@@ -496,18 +1011,33 @@ async function renderDashboard(container) {
         </div>
       </div>
     ` : `
+      ${buildBulkToolbar({
+        key: bulkKey,
+        itemLabel: '邮箱',
+        actions: [
+          { value: 'delete', label: '删除选中邮箱', run: () => window.bulkDeleteMailboxes(bulkKey) },
+        ],
+      })}
       <div class="mailbox-grid" id="mailbox-grid" style="margin-top:0.8rem">
-        ${boxes.map(mb => buildMailboxCard(mb)).join('')}
+        ${boxes.map(mb => buildMailboxCard(mb, bulkKey)).join('')}
       </div>
     `}
   `;
 }
 
-function buildMailboxCard(mb) {
+function buildMailboxCard(mb, bulkKey = 'dashboard-mailboxes') {
   const expiresAt = mb.expires_at ? new Date(mb.expires_at) : null;
   const now = new Date();
   let expiryHtml = '';
-  if (expiresAt) {
+  const permanentHtml = mb.is_permanent
+    ? `<span class="badge badge-green" style="font-size:0.72rem">永久</span>`
+    : '';
+  const catchallHtml = mb.is_catchall
+    ? `<span class="badge badge-gray" style="font-size:0.72rem">Catch-all</span>`
+    : '';
+  if (mb.is_permanent) {
+    expiryHtml = '<span style="color:var(--clr-success);font-size:0.75rem">♾ 永久保留</span>';
+  } else if (expiresAt) {
     const diffMs = expiresAt - now;
     if (diffMs <= 0) {
       expiryHtml = '<span style="color:var(--clr-danger);font-size:0.75rem">⏱ 已过期</span>';
@@ -519,7 +1049,14 @@ function buildMailboxCard(mb) {
   }
   return `
     <div class="mailbox-card" onclick="openInbox('${mb.id}','${escHtml(mb.full_address)}')">
-      <div class="mailbox-address">${escHtml(mb.full_address)}</div>
+      <div class="mailbox-address" style="display:flex;align-items:center;gap:0.45rem;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;cursor:pointer" onclick="event.stopPropagation()">
+          <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${mb.id}" ${isBulkSelected(bulkKey, mb.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${mb.id}', this.checked)">
+        </label>
+        <span>${escHtml(mb.full_address)}</span>
+        ${permanentHtml}
+        ${catchallHtml}
+      </div>
       <div class="mailbox-stats" style="display:flex;gap:0.7rem;align-items:center">
         <span>创建于 ${formatDate(mb.created_at)}</span>
         ${expiryHtml}
@@ -533,8 +1070,46 @@ function buildMailboxCard(mb) {
   `;
 }
 
-window.openInbox = function(id, addr) {
-  state.currentMailbox = { id, full_address: addr };
+window.bulkDeleteMailboxes = async function(selectionKey = 'dashboard-mailboxes') {
+  await runBulkDelete({
+    selectionKey,
+    itemLabel: '邮箱',
+    onDelete: id => api.deleteMailbox(id),
+    onDone: async () => navigate('dashboard'),
+  });
+};
+
+function isAdminCatchallScope(mb = state.currentMailbox) {
+  return mb?.scope === 'admin-catchall';
+}
+
+function getMailboxBackPage(mb = state.currentMailbox) {
+  return isAdminCatchallScope(mb) ? 'admin-catchall' : 'dashboard';
+}
+
+async function listEmailsForMailbox(mb = state.currentMailbox) {
+  if (!mb) return [];
+  return isAdminCatchallScope(mb)
+    ? api.admin.listCatchallEmails(mb.id)
+    : api.listEmails(mb.id);
+}
+
+async function getEmailForMailbox(eid, mb = state.currentMailbox) {
+  if (!mb) return null;
+  return isAdminCatchallScope(mb)
+    ? api.admin.getCatchallEmail(mb.id, eid)
+    : api.getEmail(mb.id, eid);
+}
+
+async function deleteEmailForMailbox(eid, mb = state.currentMailbox) {
+  if (!mb) return null;
+  return isAdminCatchallScope(mb)
+    ? api.admin.deleteCatchallEmail(mb.id, eid)
+    : api.deleteEmail(mb.id, eid);
+}
+
+window.openInbox = function(id, addr, scope = 'regular') {
+  state.currentMailbox = { id, full_address: addr, scope };
   navigate('inbox');
 };
 
@@ -549,26 +1124,99 @@ window.createMailbox = async function() {
   const old = document.querySelector('.modal-overlay');
   if (old) old.remove();
   const overlay = el('div', 'modal-overlay');
+  const isAdmin = !!state.account?.is_admin;
+  const permanentUsed = getPermanentMailboxUsage(state.mailboxes);
+  const permanentQuota = getPermanentMailboxQuota(state.account);
+  const permanentRemaining = getPermanentMailboxRemaining(state.mailboxes, state.account);
+  const permanentDisabled = !isAdmin && permanentRemaining <= 0;
+  const { exact: exactDomains, wildcard: wildcardDomains } = splitManagedDomains(activeDomains);
 
-  const domainOptions = activeDomains.map(d =>
+  const domainOptions = exactDomains.map(d =>
     `<option value="${escHtml(d.domain)}">${escHtml(d.domain)}</option>`
   ).join('');
+  const wildcardHint = wildcardDomains.length > 0
+    ? `已启用通配域名规则：${wildcardDomains.map(d => `<code>${escHtml(d.domain)}</code> → 例如 <code>${escHtml(getWildcardDomainExample(d.domain))}</code>`).join('；')}。`
+    : '若后续添加了通配域名（如 *.example.com），请在下方输入真实子域名，例如 inbox.example.com。';
+  const customDomainPlaceholder = wildcardDomains[0]
+    ? getWildcardDomainExample(wildcardDomains[0].domain)
+    : 'inbox.example.com';
+  const wildcardOptions = wildcardDomains.map(d =>
+    `<option value="${escHtml(d.domain)}">${escHtml(d.domain)}（基于 ${escHtml(getWildcardBaseDomain(d.domain))} 分配真实子域）</option>`
+  ).join('');
+  const wildcardModeOptions = `
+    <option value="random">完全随机</option>
+    <option value="wordlist">词库随机（可后台编辑）</option>
+    <option value="custom">自定义</option>
+  `;
+  const wildcardQuickFillHtml = wildcardDomains.length > 0 ? `
+    <div class="form-group">
+      <label class="form-label">通配规则快捷示例</label>
+      <div class="domain-quick-list">
+        ${wildcardDomains.map(d => `
+          <button type="button" class="domain-quick-btn" data-fill-domain="${escHtml(getWildcardDomainExample(d.domain))}">
+            <span class="domain-quick-title">${escHtml(d.domain)}</span>
+            <span class="domain-quick-note">填入 ${escHtml(getWildcardDomainExample(d.domain))}</span>
+          </button>
+        `).join('')}
+      </div>
+      <div class="form-hint">点一下即可把示例子域填入上面的“指定实际收件域名”输入框，再按需修改前缀。</div>
+    </div>
+  ` : '';
 
   overlay.innerHTML = `
-    <div class="modal" style="max-width:420px">
-      <div class="modal-title">+ 新建临时邮箱</div>
+    <div class="modal" style="max-width:500px">
+      <div class="modal-title">+ 新建邮箱</div>
       <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button>
       <div class="form-group" style="margin-top:0.8rem">
         <label class="form-label">本地部分（@ 之前）</label>
         <input class="form-input" id="mb-address" placeholder="留空则随机生成" autocomplete="off" />
-        <div class="form-hint">只允许字母、数字、连字符、下划线</div>
+        <div class="form-hint">只允许小写字母、数字、连字符、下划线。部分系统地址（如 admin / noreply / postmaster）仅管理员可创建。</div>
       </div>
       <div class="form-group">
-        <label class="form-label">域名</label>
+        <label class="form-label">精确域名（可选）</label>
         <select class="form-input" id="mb-domain">
-          <option value="">随机选取</option>
+          <option value="">随机选取${exactDomains.length === 0 ? '（当前无精确域名）' : ''}</option>
           ${domainOptions}
         </select>
+        <div class="form-hint">这里只显示可直接选取的精确域名；通配域名规则不会直接出现在下拉框中。</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">指定实际收件域名（可选，优先级更高）</label>
+        <input class="form-input" id="mb-domain-custom" placeholder="${escHtml(customDomainPlaceholder)}" autocomplete="off" />
+        <div class="form-hint">${wildcardHint} 留空时会使用上面的精确域名选择或随机分配。</div>
+      </div>
+      ${wildcardDomains.length > 0 ? `
+        <div class="form-group">
+          <label class="form-label">或选择通配规则生成 / 指定子域</label>
+          <select class="form-input" id="mb-domain-wildcard">
+            <option value="">不自动生成</option>
+            ${wildcardOptions}
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">通配子域模式</label>
+          <select class="form-input" id="mb-domain-wildcard-mode">
+            ${wildcardModeOptions}
+          </select>
+          <div class="form-hint" id="mb-domain-wildcard-hint">默认会调用 <code>auto_subdomain=true</code> 并完全随机生成真实子域。</div>
+        </div>
+        <div class="form-group" id="mb-domain-wildcard-custom-wrap" style="display:none">
+          <label class="form-label">自定义子域前缀 / 实际域名</label>
+          <input class="form-input" id="mb-domain-wildcard-custom" placeholder="如 inbox 或 team.mail" autocomplete="off" />
+          <div class="form-hint" id="mb-domain-wildcard-custom-hint">输入 <code>inbox</code> 会自动拼成 <code>inbox.example.com</code>；也可直接输入完整域名。</div>
+        </div>
+      ` : ''}
+      ${wildcardQuickFillHtml}
+      <div class="form-group">
+        <label class="form-label" style="display:flex;align-items:center;gap:0.45rem">
+          <input type="checkbox" id="mb-permanent" ${permanentDisabled ? 'disabled' : ''} />
+          创建为永久邮箱
+        </label>
+        <div class="form-hint">
+          ${isAdmin
+            ? '管理员可创建无限个永久邮箱；永久邮箱不会自动过期。'
+            : `当前已使用 ${permanentUsed}/${permanentQuota} 个永久邮箱额度，剩余 ${permanentRemaining} 个。${permanentDisabled ? '额度已用完，可继续创建临时邮箱。' : ''}`}
+        </div>
       </div>
       <div class="modal-actions">
         <button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()">取消</button>
@@ -580,23 +1228,151 @@ window.createMailbox = async function() {
   overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
 
   // 回车确认
-  overlay.querySelector('#mb-address').addEventListener('keydown', e => {
+  const addressInput = overlay.querySelector('#mb-address');
+  addressInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') overlay.querySelector('#mb-confirm-btn').click();
   });
+  overlay.querySelector('#mb-domain-custom').addEventListener('keydown', e => {
+    if (e.key === 'Enter') overlay.querySelector('#mb-confirm-btn').click();
+  });
+  const exactSelect = overlay.querySelector('#mb-domain');
+  const customDomainInput = overlay.querySelector('#mb-domain-custom');
+  const wildcardSelect = overlay.querySelector('#mb-domain-wildcard');
+  const wildcardModeSelect = overlay.querySelector('#mb-domain-wildcard-mode');
+  const wildcardHintEl = overlay.querySelector('#mb-domain-wildcard-hint');
+  const wildcardCustomWrap = overlay.querySelector('#mb-domain-wildcard-custom-wrap');
+  const wildcardCustomInput = overlay.querySelector('#mb-domain-wildcard-custom');
+  const wildcardCustomHintEl = overlay.querySelector('#mb-domain-wildcard-custom-hint');
+
+  wildcardCustomInput?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') overlay.querySelector('#mb-confirm-btn').click();
+  });
+
+  function refreshWildcardModeUi() {
+    const selectedMode = wildcardModeSelect?.value || 'random';
+    if (wildcardCustomWrap) {
+      wildcardCustomWrap.style.display = selectedMode === 'custom' ? '' : 'none';
+    }
+    if (wildcardCustomInput) {
+      wildcardCustomInput.disabled = selectedMode !== 'custom';
+    }
+  }
+
+  function refreshWildcardHint() {
+    if (!wildcardHintEl) return;
+    const selectedRule = wildcardSelect?.value || '';
+    const selectedMode = wildcardModeSelect?.value || 'random';
+    if (!selectedRule) {
+      wildcardHintEl.innerHTML = '选择通配规则后，可切到“完全随机 / 词库随机 / 自定义”三种子域模式。';
+      if (wildcardCustomHintEl) {
+        wildcardCustomHintEl.innerHTML = '输入 <code>inbox</code> 会自动拼成 <code>inbox.example.com</code>；也可直接输入完整域名。';
+      }
+      return;
+    }
+    const base = getWildcardBaseDomain(selectedRule);
+    const localPart = addressInput?.value.trim() || '随机地址';
+    if (selectedMode === 'wordlist') {
+      wildcardHintEl.innerHTML = `会调用 <code>auto_subdomain=true</code> + <code>subdomain_mode=wordlist</code>，从后台可编辑的子域词库里随机选择标签，并创建类似 <code>${escHtml(localPart)}@support-center.${escHtml(base)}</code> 的地址。`;
+    } else if (selectedMode === 'custom') {
+      const preview = buildWildcardCustomDomain(selectedRule, wildcardCustomInput?.value || 'inbox');
+      wildcardHintEl.innerHTML = `不会走自动分配，而是直接使用你指定的真实子域。`;
+      if (wildcardCustomHintEl) {
+        wildcardCustomHintEl.innerHTML = `当前将创建 <code>${escHtml(localPart)}@${escHtml(preview || `inbox.${base}`)}</code>。`;
+      }
+    } else {
+      wildcardHintEl.innerHTML = `会调用 <code>auto_subdomain=true</code> 并完全随机生成真实子域，创建类似 <code>${escHtml(localPart)}@&lt;随机&gt;.${escHtml(base)}</code> 的地址。`;
+      if (wildcardCustomHintEl) {
+        wildcardCustomHintEl.innerHTML = '输入 <code>inbox</code> 会自动拼成 <code>inbox.example.com</code>；也可直接输入完整域名。';
+      }
+    }
+  }
+
+  wildcardModeSelect?.addEventListener('change', () => {
+    refreshWildcardModeUi();
+    refreshWildcardHint();
+  });
+  addressInput?.addEventListener('input', refreshWildcardHint);
+  exactSelect?.addEventListener('change', () => {
+    if (exactSelect.value && wildcardSelect) {
+      wildcardSelect.value = '';
+      refreshWildcardHint();
+    }
+  });
+  customDomainInput?.addEventListener('input', () => {
+    if (customDomainInput.value.trim() && wildcardSelect) {
+      wildcardSelect.value = '';
+      refreshWildcardHint();
+    }
+  });
+  wildcardSelect?.addEventListener('change', () => {
+    if (wildcardSelect.value) {
+      if (exactSelect) exactSelect.value = '';
+      if (customDomainInput) customDomainInput.value = '';
+    }
+    refreshWildcardHint();
+  });
+  wildcardCustomInput?.addEventListener('input', refreshWildcardHint);
+  overlay.querySelectorAll('[data-fill-domain]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = overlay.querySelector('#mb-domain-custom');
+      if (!target) return;
+      target.value = btn.dataset.fillDomain || '';
+      if (exactSelect) exactSelect.value = '';
+      if (wildcardSelect) wildcardSelect.value = '';
+      refreshWildcardHint();
+      target.focus();
+      target.setSelectionRange(0, target.value.length);
+    });
+  });
+  refreshWildcardModeUi();
+  refreshWildcardHint();
 
   overlay.querySelector('#mb-confirm-btn').addEventListener('click', async () => {
     const btn     = overlay.querySelector('#mb-confirm-btn');
     const address = overlay.querySelector('#mb-address').value.trim();
-    const domain  = overlay.querySelector('#mb-domain').value;
+    const selectedDomain = exactSelect?.value || '';
+    const selectedWildcardRule = wildcardSelect?.value || '';
+    const selectedWildcardMode = wildcardModeSelect?.value || 'random';
+    const wildcardCustomDomain = buildWildcardCustomDomain(selectedWildcardRule, wildcardCustomInput?.value || '');
+    const customDomain = normalizeDomainInput(customDomainInput?.value || '');
+    let domain  = customDomain || selectedWildcardRule || selectedDomain;
+    let autoSubdomain = !customDomain && !!selectedWildcardRule && selectedWildcardMode !== 'custom';
+    const permanent = overlay.querySelector('#mb-permanent')?.checked || false;
     btn.disabled  = true;
     btn.textContent = '创建中...';
     try {
+      if (!customDomain && selectedWildcardRule && selectedWildcardMode === 'custom') {
+        if (!wildcardCustomDomain) {
+          throw new Error('请选择通配规则后，再填写自定义子域前缀或完整域名。');
+        }
+        domain = wildcardCustomDomain;
+        autoSubdomain = false;
+      }
+      if (!domain && exactDomains.length === 0 && wildcardDomains.length > 0) {
+        throw new Error('当前只有通配域名规则，请输入一个真实子域名，或直接在“自动生成子域”里选择一条 wildcard 规则。');
+      }
       const body = {};
       if (address) body.address = address;
       if (domain)  body.domain  = domain;
-      const mb = await api.createMailbox(body);
+      if (permanent) body.permanent = true;
+      if (autoSubdomain) {
+        body.auto_subdomain = true;
+        body.subdomain_mode = selectedWildcardMode === 'wordlist' ? 'wordlist' : 'random';
+      }
+      const resp = await api.createMailbox(body);
+      const mb = resp.mailbox || resp;
       overlay.remove();
-      toast(`已创建：${mb.full_address}`, 'success');
+      if (resp.auto_subdomain && resp.subdomain_mode === 'wordlist') {
+        toast(`已按词库分配：${mb.full_address}`, 'success');
+      } else if (resp.auto_subdomain) {
+        toast(`已自动分配：${mb.full_address}`, 'success');
+      } else if (resp.claimed) {
+        toast(`已认领：${mb.full_address}`, 'success');
+      } else if (resp.message === 'mailbox already exists') {
+        toast(`已存在：${mb.full_address}`, 'success');
+      } else {
+        toast(`已创建：${mb.full_address}`, 'success');
+      }
       navigate('dashboard');
     } catch(e) {
       btn.disabled = false;
@@ -643,30 +1419,39 @@ function renderApiKeyShow(container) {
 }
 
 // ─── Inbox ────────────────────────────────────────────────
+function getInboxBulkKey(mb = state.currentMailbox) {
+  if (!mb?.id) return 'inbox-emails';
+  return `inbox-emails-${mb.scope || 'regular'}-${mb.id}`;
+}
+
 async function renderInbox(container) {
   const mb = state.currentMailbox;
   if (!mb) { navigate('dashboard'); return; }
+  const bulkKey = getInboxBulkKey(mb);
+  const backPage = getMailboxBackPage(mb);
 
   const title = $('topbar-title'); if (title) title.textContent = mb.full_address;
-  const sub   = $('topbar-subtitle'); if (sub) sub.textContent = '邮件列表';
+  const sub   = $('topbar-subtitle'); if (sub) sub.textContent = isAdminCatchallScope(mb) ? 'Catch-all 邮件列表' : '邮件列表';
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `
       <button class="btn btn-ghost btn-sm" onclick="copyText('${escHtml(mb.full_address)}')">⎘ 复制地址</button>
       <button class="btn btn-primary btn-sm" onclick="refreshInbox()" style="margin-left:0.4rem">↻ 刷新</button>
-      <button class="btn btn-ghost btn-sm" onclick="navigate('dashboard')" style="margin-left:0.4rem">← 返回</button>
+      <button class="btn btn-ghost btn-sm" onclick="navigate('${backPage}')" style="margin-left:0.4rem">← 返回</button>
     `;
   }
 
-  const emails = await api.listEmails(mb.id);
+  const emails = await listEmailsForMailbox(mb);
   state.emails = emails || [];
+  setBulkVisibleIds(bulkKey, state.emails.map(e => e.id));
 
   // 启动自动刷新（每 8 秒）
   clearInboxPoller();
   _inboxPollerTimer = setInterval(async () => {
     if (state.page !== 'inbox') { clearInboxPoller(); return; }
+    if (document.hidden) return;
     try {
-      const fresh = await api.listEmails(mb.id);
+      const fresh = await listEmailsForMailbox(mb);
       if (!fresh) return;
       // 有新邮件才重新渲染，避免闪烁
       if (fresh.length !== (state.emails || []).length ||
@@ -692,13 +1477,20 @@ async function renderInbox(container) {
   }
 
   container.innerHTML = `
+    ${buildBulkToolbar({
+      key: bulkKey,
+      itemLabel: '邮件',
+      actions: [
+        { value: 'delete', label: '删除选中邮件', run: () => window.bulkDeleteEmails(bulkKey) },
+      ],
+    })}
     <div class="card" style="padding:0">
-      ${state.emails.map(e => buildEmailItem(mb.id, e)).join('')}
+      ${state.emails.map(e => buildEmailItem(mb.id, e, bulkKey)).join('')}
     </div>
   `;
 }
 
-function buildEmailItem(mbId, e) {
+function buildEmailItem(mbId, e, bulkKey = getInboxBulkKey()) {
   const from = e.sender || e.from_addr || '(无发件人)';
   const initials = from.charAt(0).toUpperCase();
   const preview = (e.body_text || e.text_body || '').slice(0, 80).replace(/\n/g, ' ');
@@ -711,6 +1503,9 @@ function buildEmailItem(mbId, e) {
         <div class="email-preview">${escHtml(preview)}</div>
       </div>
       <div>
+        <label style="display:flex;justify-content:flex-end;cursor:pointer" onclick="event.stopPropagation()">
+          <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${e.id}" ${isBulkSelected(bulkKey, e.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${e.id}', this.checked)">
+        </label>
         <div class="email-time">${timeAgo(e.received_at)}</div>
         <button class="btn btn-ghost btn-sm" style="margin-top:0.3rem" onclick="event.stopPropagation();deleteEmail('${mbId}','${e.id}')">✕</button>
       </div>
@@ -731,17 +1526,30 @@ window.refreshInbox = function() {
 
 window.deleteEmail = async function(mbId, eid) {
   try {
-    await api.deleteEmail(mbId, eid);
+    const mb = state.currentMailbox && state.currentMailbox.id === mbId
+      ? state.currentMailbox
+      : { id: mbId, scope: 'regular' };
+    await deleteEmailForMailbox(eid, mb);
     toast('邮件已删除', 'success');
     navigate('inbox');
   } catch(e) { toast('删除失败: ' + e.message, 'error'); }
+};
+
+window.bulkDeleteEmails = async function(selectionKey = getInboxBulkKey()) {
+  const mailbox = state.currentMailbox;
+  await runBulkDelete({
+    selectionKey,
+    itemLabel: '邮件',
+    onDelete: id => deleteEmailForMailbox(id, mailbox),
+    onDone: async () => navigate('inbox'),
+  });
 };
 
 // ─── Email View ────────────────────────────────────────────
 async function renderEmailView(container) {
   const mb = state.currentMailbox;
   const eid = state.currentEmailId;
-  if (!mb || !eid) { navigate('dashboard'); return; }
+  if (!mb || !eid) { navigate(getMailboxBackPage(mb)); return; }
 
   const actions = $('topbar-actions');
   if (actions) {
@@ -751,7 +1559,7 @@ async function renderEmailView(container) {
     `;
   }
 
-  const e = await api.getEmail(mb.id, eid);
+  const e = await getEmailForMailbox(eid, mb);
   const fromAddr = e.sender || e.from_addr || '—';
   const toAddr   = mb.full_address || state.currentMailbox?.full_address || '—';
   const htmlBody  = e.body_html || e.html_body || '';
@@ -761,7 +1569,7 @@ async function renderEmailView(container) {
 
   // 先渲染完整 HTML（含 iframe 占位），再向 iframe 写入内容
   container.innerHTML = `
-    <div class="card" style="padding:0;max-width:860px">
+    <div class="card" style="padding:0;max-width:980px">
       <div class="email-detail-header">
         <div class="email-subject-big">${escHtml(e.subject || '(无主题)')}</div>
         <div class="email-info-row">
@@ -801,6 +1609,7 @@ async function renderDomainsGuide(container) {
   if (actions) {
     actions.innerHTML = `<button class="btn btn-success btn-sm" onclick="showMXRegisterModal()">⚡ 提交域名自动验证</button>`;
   }
+  clearPendingDomainPoller();
 
   const [domains, pub] = await Promise.all([
     api.domains(),
@@ -814,20 +1623,43 @@ async function renderDomainsGuide(container) {
 
   const pending = (domains||[]).filter(d => d.status === 'pending');
   const active  = (domains||[]).filter(d => d.status !== 'pending');
+  const activeGroups = splitManagedDomains(active);
+  const pendingGroups = splitManagedDomains(pending);
+
+  const summaryCardsHtml = `
+    <div class="stat-grid domain-overview-grid">
+      <div class="stat-card">
+        <div class="stat-label">精确域名</div>
+        <div class="stat-value">${activeGroups.exact.length}</div>
+        <div class="stat-note">可直接作为 @domain 使用</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">通配规则</div>
+        <div class="stat-value">${activeGroups.wildcard.length}</div>
+        <div class="stat-note">覆盖任意子域，不含根域</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">待验证</div>
+        <div class="stat-value">${pending.length}</div>
+        <div class="stat-note">${pending.length > 0 ? `精确 ${pendingGroups.exact.length} / 通配 ${pendingGroups.wildcard.length}` : '当前无待验证项'}</div>
+      </div>
+    </div>
+  `;
 
   const pendingHtml = pending.length > 0 ? `
-    <div class="card" style="border-left:3px solid var(--clr-warn,#e6a817);margin-bottom:1rem">
+    <div class="card" style="border-left:3px solid var(--clr-warn,#e6a817)">
       <div class="card-header">
         <div class="card-title">🔄 待 MX 验证 (${pending.length})</div>
         <div style="font-size:0.78rem;color:var(--text-muted)">后台每 30 秒自动检测，验证通过后自动激活</div>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>域名</th><th>上次检测</th><th>状态</th></tr></thead>
+          <thead><tr><th>域名</th><th>类型</th><th>上次检测</th><th>状态</th></tr></thead>
           <tbody>
             ${pending.map(d => `
               <tr id="pending-row-${d.id}">
                 <td style="font-family:var(--font-mono);font-size:0.82rem">${escHtml(d.domain)}</td>
+                <td>${renderDomainTypeHtml(d.domain)}</td>
                 <td style="font-size:0.78rem">${d.mx_checked_at ? timeAgo(d.mx_checked_at) : '待首次检测'}</td>
                 <td><span class="badge badge-gold" id="pending-status-${d.id}">⏳ 检测中</span></td>
               </tr>
@@ -838,34 +1670,79 @@ async function renderDomainsGuide(container) {
     </div>
   ` : '';
 
-  container.innerHTML = `
-    ${pendingHtml}
-    <div class="domain-guide-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:1.2rem;max-width:1000px">
-      <div>
-        <div class="card">
-          <div class="card-header"><div class="card-title">◎ 可用域名池</div></div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>域名</th><th>状态</th></tr></thead>
-              <tbody>
-                ${active.length === 0
-                  ? `<tr><td colspan="2" style="text-align:center;color:var(--text-muted)">暂无域名</td></tr>`
-                  : active.map(d => `
-                    <tr>
-                      <td style="font-family:var(--font-mono);font-size:0.82rem">${escHtml(d.domain)}</td>
-                      <td>${d.is_active
-                        ? '<span class="badge badge-green">● 启用</span>'
-                        : '<span class="badge badge-gray">○ 停用</span>'}</td>
-                    </tr>
-                  `).join('')}
-              </tbody>
-            </table>
-          </div>
-        </div>
+  const exactDomainsHtml = `
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">◎ 精确域名</div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.exact.length} 个</div>
       </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>域名</th><th>说明</th><th>状态</th></tr></thead>
+          <tbody>
+            ${activeGroups.exact.length === 0
+              ? `<tr><td colspan="3" style="text-align:center;color:var(--text-muted)">暂无精确域名</td></tr>`
+              : activeGroups.exact.map(d => `
+                <tr>
+                  <td style="font-family:var(--font-mono);font-size:0.82rem" title="${escHtml(d.domain)}">${escHtml(d.domain)}</td>
+                  <td>
+                    <div class="domain-example-stack">
+                      <code title="${escHtml(d.domain)}">${escHtml(d.domain)}</code>
+                      <div class="domain-example-note" title="可直接创建如 hello@${escHtml(d.domain)}">可直接创建如 hello@${escHtml(d.domain)}</div>
+                    </div>
+                  </td>
+                  <td>${d.is_active
+                    ? '<span class="badge badge-green">● 启用</span>'
+                    : '<span class="badge badge-gray">○ 停用</span>'}</td>
+                </tr>
+              `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
 
-      <div>
-        <div class="card">
+  const wildcardDomainsHtml = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">✳ 通配子域规则</div>
+          <div class="domain-section-hint">匹配任意子域，例如 <code>team.example.com</code>，但不会匹配根域 <code>example.com</code></div>
+        </div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.wildcard.length} 个</div>
+      </div>
+      <div class="table-wrap">
+        <table class="wildcard-domain-table">
+          <thead><tr><th>规则</th><th>匹配示例</th><th>状态</th></tr></thead>
+          <tbody>
+            ${activeGroups.wildcard.length === 0
+              ? `<tr><td colspan="3" style="text-align:center;color:var(--text-muted)">暂无通配规则</td></tr>`
+              : activeGroups.wildcard.map(d => `
+                <tr>
+                  <td class="domain-rule-cell">
+                    <div class="domain-rule-code" title="${escHtml(d.domain)}">${escHtml(d.domain)}</div>
+                    <div style="margin-top:0.3rem">${renderDomainTypeHtml(d.domain)}</div>
+                  </td>
+                  <td class="domain-example-cell">${renderWildcardExamplesHtml(d.domain)}</td>
+                  <td>${d.is_active
+                    ? '<span class="badge badge-green">● 启用</span>'
+                    : '<span class="badge badge-gray">○ 停用</span>'}</td>
+                </tr>
+              `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  container.innerHTML = `
+    <div class="page-stack page-stack-guide">
+      ${summaryCardsHtml}
+      ${pendingHtml}
+      <div class="domain-sections-grid">
+        ${exactDomainsHtml}
+        ${wildcardDomainsHtml}
+        <div class="card domain-guide-card">
           <div class="card-header"><div class="card-title">📖 添加域名指南</div></div>
           <div class="card-body">
             <div class="guide-step">
@@ -888,6 +1765,9 @@ async function renderDomainsGuide(container) {
                     <tr><td>TXT</td><td>@</td><td style="font-family:monospace">v=spf1 ip4:${ipLabel} ~all</td><td>—</td></tr>
                   </tbody>
                 </table>
+                <div class="step-desc" style="margin-top:0.6rem">
+                  如果你想接收任意子域（例如 <code>user@a.example.com</code>、<code>user@b.c.example.com</code>），可以提交 <code>*.example.com</code> 作为通配规则。此时把 MX/TXT 记录的主机名改为 <code>*</code>；注意这<strong>不包含根域</strong> <code>example.com</code>，若根域也要收信，请再单独添加一次精确域名。
+                </div>
               </div>
             </div>
             <div class="guide-step">
@@ -908,7 +1788,7 @@ async function renderDomainsGuide(container) {
               <div class="step-num">4</div>
               <div class="step-body">
                 <div class="step-title">验证收信</div>
-                <div class="step-desc">域名激活后，创建该域名下的邮箱，用其他邮件客户端发送测试邮件，30 秒内应能收到。</div>
+                <div class="step-desc">域名激活后，创建该域名下的邮箱，用其他邮件客户端发送测试邮件，30 秒内应能收到。若使用通配规则，可直接创建实际子域（例如 <code>demo.example.com</code>）下的邮箱地址。</div>
               </div>
             </div>
           </div>
@@ -924,44 +1804,87 @@ async function renderDomainsGuide(container) {
 
 // ─── Admin: 账户管理 ─────────────────────────────────────────
 async function renderAdminAccounts(container) {
+  const bulkKey = 'admin-accounts';
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `<button class="btn btn-primary btn-sm" onclick="showCreateAccountModal()">+ 创建账户</button>`;
   }
 
   const accounts = await api.admin.listAccounts();
+  const deletableAccountIds = (accounts || [])
+    .filter(a => !a.is_system && !a.is_admin)
+    .map(a => a.id);
+  setBulkVisibleIds(bulkKey, deletableAccountIds);
   container.innerHTML = `
-    <div class="card" style="max-width:860px">
-      <div class="card-header">
-        <div class="card-title">👥 账户列表</div>
-        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${(accounts||[]).length} 个账户</div>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr><th>用户名</th><th>角色</th><th>创建时间</th><th>操作</th></tr>
-          </thead>
-          <tbody>
-            ${(accounts||[]).map(a => `
-              <tr>
-                <td>
-                  <div style="font-weight:600">${escHtml(a.username || '—')}</div>
-                  <div class="code-box" style="margin-top:0.3rem;font-size:0.72rem">
-                    <span>${escHtml(a.api_key || '—')}</span>
-                    <button class="copy-btn" onclick="copyText('${escHtml(a.api_key||'')}')">⎘</button>
-                  </div>
-                </td>
-                <td>${a.is_admin
-                  ? '<span class="badge badge-gold">管理员</span>'
-                  : '<span class="badge badge-gray">普通用户</span>'}</td>
-                <td style="font-size:0.8rem">${formatDate(a.created_at)}</td>
-                <td>
-                  ${!a.is_admin ? `<button class="btn btn-danger btn-sm" onclick="confirmDeleteAccount('${a.id}','${escHtml(a.username||'')}')">删除</button>` : ''}
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
+    <div style="max-width:1240px;display:flex;flex-direction:column;gap:1rem">
+      ${deletableAccountIds.length > 0 ? buildBulkToolbar({
+        key: bulkKey,
+        itemLabel: '可删除账户',
+        actions: [
+          { value: 'delete', label: '删除选中账户', run: () => window.bulkDeleteAccounts(bulkKey) },
+        ],
+      }) : ''}
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">👥 账户列表</div>
+          <div style="font-size:0.78rem;color:var(--text-muted)">共 ${(accounts||[]).length} 个账户</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th style="width:44px">选择</th><th>用户名</th><th>角色</th><th>永久邮箱额度</th><th>创建时间</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              ${(accounts||[]).map(a => `
+                <tr>
+                  <td style="text-align:center">
+                    ${(!a.is_system && !a.is_admin)
+                      ? `<input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${a.id}" ${isBulkSelected(bulkKey, a.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${a.id}', this.checked)">`
+                      : '<span style="font-size:0.75rem;color:var(--text-muted)">—</span>'}
+                  </td>
+                  <td>
+                    <div style="font-weight:600">${escHtml(a.username || '—')}</div>
+                    ${a.is_system
+                      ? `<div style="margin-top:0.35rem;font-size:0.74rem;color:var(--text-muted)">系统保留账号，内部用于 catch-all 暂存</div>`
+                      : `
+                        <div class="code-box" style="margin-top:0.3rem;font-size:0.72rem">
+                          <span>${escHtml(a.api_key || '—')}</span>
+                          <button class="copy-btn" onclick="copyText('${escHtml(a.api_key||'')}')">⎘</button>
+                        </div>
+                      `}
+                  </td>
+                  <td>
+                    ${a.is_system
+                      ? '<span class="badge badge-gray">系统账号</span>'
+                      : (a.is_admin
+                        ? '<span class="badge badge-gold">管理员</span>'
+                        : '<span class="badge badge-gray">普通用户</span>')}
+                    ${a.id === state.account?.id ? '<div style="margin-top:0.35rem;font-size:0.74rem;color:var(--text-muted)">当前登录账号</div>' : ''}
+                  </td>
+                  <td>
+                    ${a.is_system
+                      ? '<span style="font-size:0.76rem;color:var(--text-muted)">—</span>'
+                      : (a.is_admin
+                        ? '<div style="font-weight:600">∞</div><div style="margin-top:0.35rem;font-size:0.74rem;color:var(--text-muted)">管理员无限制</div>'
+                        : `<div style="font-weight:600">${Number(a.permanent_mailbox_quota || 0)} 个</div><div style="margin-top:0.35rem;font-size:0.74rem;color:var(--text-muted)">可由管理员追加</div>`)}
+                  </td>
+                  <td style="font-size:0.8rem">${formatDate(a.created_at)}</td>
+                  <td>
+                    ${a.is_system ? '<span style="font-size:0.76rem;color:var(--text-muted)">系统保留</span>' : `
+                      <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
+                        ${!a.is_admin ? `<button class="btn btn-ghost btn-sm" onclick="showSetAccountQuotaModal('${a.id}', '${escHtml(a.username||'')}', ${Number(a.permanent_mailbox_quota || 0)})">永久额度</button>` : ''}
+                        ${a.is_admin
+                          ? `<button class="btn btn-ghost btn-sm" onclick="toggleAccountAdmin('${a.id}', false, '${escHtml(a.username||'')}')">解除管理员</button>`
+                          : `<button class="btn btn-success btn-sm" onclick="toggleAccountAdmin('${a.id}', true, '${escHtml(a.username||'')}')">设为管理员</button>`}
+                        ${!a.is_admin ? `<button class="btn btn-danger btn-sm" onclick="confirmDeleteAccount('${a.id}','${escHtml(a.username||'')}')">删除</button>` : ''}
+                      </div>
+                    `}
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   `;
@@ -1001,8 +1924,203 @@ window.confirmDeleteAccount = function(id, name) {
   });
 };
 
+window.showSetAccountQuotaModal = function(id, name, currentQuota) {
+  showModal('调整永久邮箱额度', `
+    <div class="form-group">
+      <label class="form-label">账户</label>
+      <div class="code-box" style="font-size:0.82rem">${escHtml(name)}</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">永久邮箱额度</label>
+      <input class="form-input" id="account-permanent-quota" type="number" min="0" max="100000" value="${Number(currentQuota || 0)}" />
+      <div class="form-hint">仅普通用户受此额度限制；管理员始终为无限制。</div>
+    </div>
+  `, async () => {
+    const quota = Number(($('account-permanent-quota')?.value || '').trim());
+    if (!Number.isInteger(quota) || quota < 0 || quota > 100000) {
+      toast('请输入 0 - 100000 之间的整数', 'warn');
+      return false;
+    }
+    try {
+      const resp = await api.admin.setAccountQuota(id, quota);
+      const updated = resp.account || {};
+      if (updated.id && updated.id === state.account?.id) {
+        state.account = {
+          ...(state.account || {}),
+          permanent_mailbox_quota: updated.permanent_mailbox_quota,
+        };
+        localStorage.setItem('tm_account', JSON.stringify(state.account));
+      }
+      toast('永久邮箱额度已更新', 'success');
+      navigate('admin-accounts');
+    } catch (e) {
+      toast('更新失败: ' + e.message, 'error');
+      return false;
+    }
+  });
+};
+
+window.toggleAccountAdmin = function(id, isAdmin, name) {
+  const actionText = isAdmin ? '设为管理员' : '解除管理员';
+  showModal(actionText, `<p>确定将账户 <strong>${escHtml(name)}</strong> ${actionText}？</p>`, async () => {
+    try {
+      const resp = await api.admin.toggleAccountAdmin(id, isAdmin);
+      const updated = resp.account || {};
+      if (updated.id && updated.id === state.account?.id) {
+        state.account = { ...(state.account || {}), is_admin: !!updated.is_admin };
+        localStorage.setItem('tm_account', JSON.stringify(state.account));
+      }
+      toast(`已${actionText}`, 'success');
+      if (updated.id && updated.id === state.account?.id && !updated.is_admin) {
+        navigate('dashboard');
+      } else {
+        navigate('admin-accounts');
+      }
+    } catch(e) {
+      toast(`${actionText}失败: ` + e.message, 'error');
+      return false;
+    }
+  });
+};
+
+// ─── Admin: Catch-all 收件箱 ─────────────────────────────────
+async function renderAdminCatchall(container) {
+  const bulkKey = 'admin-catchall';
+  const actions = $('topbar-actions');
+  if (actions) {
+    actions.innerHTML = `<button class="btn btn-ghost btn-sm" onclick="navigate('admin-settings')">⚙ 调整 Catch-all 设置</button>`;
+  }
+
+  const [mailboxes, settings, accounts] = await Promise.all([
+    api.admin.listCatchallMailboxes().catch(() => []),
+    api.admin.getSettings().catch(() => ({})),
+    api.admin.listAccounts().catch(() => []),
+  ]);
+
+  const policy = settings.unknown_recipient_policy || 'claimable';
+  const configuredAdminId = settings.catchall_admin_account_id || '';
+  const configuredAdmin = (accounts || []).find(a => a.id === configuredAdminId);
+  const activeAdmins = (accounts || []).filter(a => a.is_admin && a.is_active && !a.is_system);
+  const fallbackAdmin = activeAdmins.slice().sort((a, b) => new Date(a.created_at) - new Date(b.created_at))[0];
+  const policyText = policy === 'admin_only'
+    ? '管理员专属模式：未知地址邮件会交给管理员 catch-all'
+    : '弱所有权模式：未知地址邮件先进入系统 catch-all，可被后续认领';
+  const ownerText = policy === 'admin_only'
+    ? (configuredAdmin
+      ? `当前指定接收管理员：${configuredAdmin.username}`
+      : (fallbackAdmin ? `当前自动接收管理员：${fallbackAdmin.username}` : '当前无可用管理员'))
+    : '当前接收者：系统账号 _catchall';
+  setBulkVisibleIds(bulkKey, (mailboxes || []).map(mb => mb.id));
+
+  container.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:1rem;max-width:1260px">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📥 Catch-all 收件箱概览</div>
+          <div style="font-size:0.78rem;color:var(--text-muted)">当前共 ${(mailboxes || []).length} 个 catch-all 地址</div>
+        </div>
+        <div class="card-body" style="font-size:0.84rem;color:var(--text-secondary);line-height:1.8">
+          <div><strong>模式：</strong>${escHtml(policyText)}</div>
+          <div><strong>接收归属：</strong>${escHtml(ownerText)}</div>
+        </div>
+      </div>
+
+      ${!mailboxes.length ? `
+        <div class="card">
+          <div class="empty-state">
+            <span class="empty-icon">📭</span>
+            <p>当前没有 catch-all 邮箱</p>
+            <p style="margin-top:0.5rem;font-size:0.8rem">当未知地址收到邮件时，这里会自动出现对应地址。</p>
+          </div>
+        </div>
+      ` : `
+        ${buildBulkToolbar({
+          key: bulkKey,
+          itemLabel: 'Catch-all 邮箱',
+          actions: [
+            { value: 'delete', label: '删除选中 Catch-all', run: () => window.bulkDeleteCatchallMailboxes(bulkKey) },
+          ],
+        })}
+        <div class="card">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th style="width:44px">选择</th><th>地址</th><th>归属</th><th>邮件数</th><th>最近邮件</th><th>过期时间</th><th>操作</th></tr>
+              </thead>
+              <tbody>
+                ${mailboxes.map(mb => `
+                  <tr>
+                    <td style="text-align:center">
+                      <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${mb.id}" ${isBulkSelected(bulkKey, mb.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${mb.id}', this.checked)">
+                    </td>
+                    <td>
+                      <div style="font-family:var(--font-mono);font-size:0.82rem">${escHtml(mb.full_address)}</div>
+                      <div style="font-size:0.74rem;color:var(--text-muted)">创建于 ${formatDate(mb.created_at)}</div>
+                    </td>
+                    <td>
+                      <span class="badge ${mb.owner_is_system ? 'badge-gray' : (mb.owner_is_admin ? 'badge-gold' : 'badge-gray')}">
+                        ${mb.owner_is_system ? '系统账号' : (mb.owner_is_admin ? '管理员' : '普通用户')}
+                      </span>
+                      <div style="margin-top:0.35rem;font-size:0.76rem;color:var(--text-muted)">${escHtml(mb.owner_username || '—')}</div>
+                    </td>
+                    <td>${Number(mb.email_count || 0).toLocaleString()}</td>
+                    <td style="font-size:0.78rem">${mb.last_received_at ? timeAgo(mb.last_received_at) : '暂无邮件'}</td>
+                    <td style="font-size:0.78rem">${mb.expires_at ? formatDate(mb.expires_at) : '—'}</td>
+                    <td>
+                      <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
+                        <button class="btn btn-ghost btn-sm" onclick="openInbox('${mb.id}','${escHtml(mb.full_address)}','admin-catchall')">查看</button>
+                        <button class="btn btn-ghost btn-sm" onclick="copyText('${escHtml(mb.full_address)}')">⎘</button>
+                        <button class="btn btn-danger btn-sm" onclick="confirmDeleteCatchallMailbox('${mb.id}','${escHtml(mb.full_address)}')">删除</button>
+                      </div>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `}
+    </div>
+  `;
+}
+
+window.bulkDeleteAccounts = async function(selectionKey = 'admin-accounts') {
+  await runBulkDelete({
+    selectionKey,
+    itemLabel: '账户',
+    onDelete: id => api.admin.deleteAccount(id),
+    onDone: async () => navigate('admin-accounts'),
+  });
+};
+
+window.bulkDeleteCatchallMailboxes = async function(selectionKey = 'admin-catchall') {
+  await runBulkDelete({
+    selectionKey,
+    itemLabel: 'Catch-all 邮箱',
+    onDelete: id => api.admin.deleteCatchallMailbox(id),
+    onDone: async () => navigate('admin-catchall'),
+  });
+};
+
+window.confirmDeleteCatchallMailbox = function(id, addr) {
+  showModal('删除 Catch-all 邮箱', `<p>确定删除 <strong>${escHtml(addr)}</strong>？<br><span style="font-size:0.8rem;color:var(--clr-danger)">该地址下所有 catch-all 邮件都会被永久删除。</span></p>`, async () => {
+    try {
+      await api.admin.deleteCatchallMailbox(id);
+      toast('Catch-all 邮箱已删除', 'success');
+      if (state.currentMailbox?.id === id) {
+        state.currentMailbox = null;
+      }
+      navigate('admin-catchall');
+    } catch (e) {
+      toast('删除失败: ' + e.message, 'error');
+      return false;
+    }
+  });
+};
+
 // ─── Admin: 域名管理 ─────────────────────────────────────────
 async function renderAdminDomains(container) {
+  const bulkKey = 'admin-domains';
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `
@@ -1010,13 +2128,137 @@ async function renderAdminDomains(container) {
       <button class="btn btn-success btn-sm" onclick="showMXRegisterModal()" style="margin-left:0.4rem">⚡ MX 自动注册</button>
     `;
   }
+  clearPendingDomainPoller();
 
   const domains = await api.domains();
+  state.adminDomains = domains || [];
   const pending  = (domains||[]).filter(d => d.status === 'pending');
   const active   = (domains||[]).filter(d => d.status !== 'pending');
+  const activeGroups = splitManagedDomains(active);
+  const pendingGroups = splitManagedDomains(pending);
+  const disabledCount = active.filter(d => !d.is_active).length;
+  setBulkVisibleIds(bulkKey, (domains || []).map(d => d.id));
+
+  const summaryCardsHtml = `
+    <div class="stat-grid domain-overview-grid">
+      <div class="stat-card">
+        <div class="stat-label">精确域名</div>
+        <div class="stat-value">${activeGroups.exact.length}</div>
+        <div class="stat-note">根域 / 单个域名规则</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">通配规则</div>
+        <div class="stat-value">${activeGroups.wildcard.length}</div>
+        <div class="stat-note">接收任意子域</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">待验证</div>
+        <div class="stat-value">${pending.length}</div>
+        <div class="stat-note">${pending.length > 0 ? `精确 ${pendingGroups.exact.length} / 通配 ${pendingGroups.wildcard.length}` : '无待验证项'}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">已停用</div>
+        <div class="stat-value">${disabledCount}</div>
+        <div class="stat-note">可随时重新启用</div>
+      </div>
+    </div>
+  `;
+
+  const exactDomainsHtml = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">🌐 精确域名</div>
+          <div class="domain-section-hint">适合根域或单独托管的业务域名</div>
+        </div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.exact.length} 个</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:44px">选择</th><th>域名</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            ${activeGroups.exact.length === 0 ? `<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">暂无精确域名</td></tr>` :
+              activeGroups.exact.map(d => `
+                <tr>
+                  <td style="text-align:center">
+                    <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${d.id}" ${isBulkSelected(bulkKey, d.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${d.id}', this.checked)">
+                  </td>
+                  <td>
+                    <div style="font-family:var(--font-mono)">${escHtml(d.domain)}</div>
+                    <div class="domain-example-note">可直接用于 hello@${escHtml(d.domain)}</div>
+                  </td>
+                  <td>${d.is_active
+                    ? '<span class="badge badge-green">● 启用</span>'
+                    : '<span class="badge badge-gray">○ 停用</span>'}</td>
+                  <td style="display:flex;gap:0.5rem;align-items:center">
+                    <button class="btn btn-ghost btn-sm" onclick="toggleDomain(${d.id},${!d.is_active})">${d.is_active ? '停用' : '启用'}</button>
+                    <button class="btn btn-danger btn-sm" onclick="confirmDeleteDomain(${d.id},'${escHtml(d.domain)}')">删除</button>
+                  </td>
+                </tr>
+              `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  const wildcardDomainsHtml = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">✳ 通配子域规则</div>
+          <div class="domain-section-hint">例如 <code>*.example.com</code>，适合接收任意子域但不接收根域</div>
+        </div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.wildcard.length} 个</div>
+      </div>
+      <div class="table-wrap">
+        <table class="wildcard-domain-table">
+          <thead><tr><th style="width:44px">选择</th><th>规则</th><th>匹配示例</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            ${activeGroups.wildcard.length === 0 ? `<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">暂无通配规则</td></tr>` :
+              activeGroups.wildcard.map(d => `
+                <tr>
+                  <td style="text-align:center">
+                    <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${d.id}" ${isBulkSelected(bulkKey, d.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${d.id}', this.checked)">
+                  </td>
+                  <td class="domain-rule-cell">
+                    <div class="domain-rule-code" title="${escHtml(d.domain)}">${escHtml(d.domain)}</div>
+                    <div style="margin-top:0.3rem">${renderDomainTypeHtml(d.domain)}</div>
+                  </td>
+                  <td class="domain-example-cell">${renderWildcardExamplesHtml(d.domain)}</td>
+                  <td>${d.is_active
+                    ? '<span class="badge badge-green">● 启用</span>'
+                    : '<span class="badge badge-gray">○ 停用</span>'}</td>
+                  <td style="display:flex;gap:0.5rem;align-items:center">
+                    <button class="btn btn-ghost btn-sm" onclick="toggleDomain(${d.id},${!d.is_active})">${d.is_active ? '停用' : '启用'}</button>
+                    <button class="btn btn-danger btn-sm" onclick="confirmDeleteDomain(${d.id},'${escHtml(d.domain)}')">删除</button>
+                  </td>
+                </tr>
+              `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
 
   container.innerHTML = `
-    <div style="max-width:760px;display:flex;flex-direction:column;gap:1rem">
+    <div class="page-stack page-stack-wide">
+      ${(domains || []).length > 0 ? buildBulkToolbar({
+        key: bulkKey,
+        itemLabel: '域名',
+        actions: [
+          { value: 'enable', label: '启用选中域名', run: () => window.bulkToggleDomains(bulkKey, true) },
+          { value: 'disable', label: '停用选中域名', run: () => window.bulkToggleDomains(bulkKey, false) },
+          { value: 'delete', label: '删除选中域名', run: () => window.bulkDeleteDomains(bulkKey) },
+        ],
+        scopeHint: '当前仅对当前已加载域名生效；启用/停用会自动跳过待验证域名，暂不支持跨页全选。',
+      }) : ''}
+      ${summaryCardsHtml}
+      <div class="card" style="border-left:3px solid var(--clr-primary,#b85c38)">
+        <div class="card-body" style="padding:0.85rem 1rem;font-size:0.8rem;color:var(--text-secondary)">
+          支持直接添加通配规则 <code>*.example.com</code>。该规则会接收任意子域邮件（如 <code>@a.example.com</code>、<code>@b.c.example.com</code>），但<strong>不会</strong>覆盖根域 <code>@example.com</code>。
+        </div>
+      </div>
       ${pending.length > 0 ? `
         <div class="card" style="border-left:3px solid var(--clr-warn,#e6a817)">
           <div class="card-header">
@@ -1025,11 +2267,15 @@ async function renderAdminDomains(container) {
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>域名</th><th>上次检测</th><th>操作</th></tr></thead>
+              <thead><tr><th style="width:44px">选择</th><th>域名</th><th>类型</th><th>上次检测</th><th>操作</th></tr></thead>
               <tbody id="pending-domains-tbody">
                 ${pending.map(d => `
                   <tr id="pending-row-${d.id}">
+                    <td style="text-align:center">
+                      <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${d.id}" ${isBulkSelected(bulkKey, d.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${d.id}', this.checked)">
+                    </td>
                     <td style="font-family:var(--font-mono)">${escHtml(d.domain)}</td>
+                    <td>${renderDomainTypeHtml(d.domain)}</td>
                     <td style="font-size:0.78rem">${d.mx_checked_at ? timeAgo(d.mx_checked_at) : '从未'}</td>
                     <td>
                       <span class="badge badge-gold" id="pending-status-${d.id}">⏳ 检测中</span>
@@ -1043,31 +2289,9 @@ async function renderAdminDomains(container) {
         </div>
       ` : ''}
 
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">🌐 域名列表</div>
-          <div style="font-size:0.78rem;color:var(--text-muted)">共 ${active.length} 个</div>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>域名</th><th>状态</th><th>操作</th></tr></thead>
-            <tbody>
-              ${active.length === 0 ? `<tr><td colspan="3" style="text-align:center;color:var(--text-muted)">暂无域名</td></tr>` :
-                active.map(d => `
-                  <tr>
-                    <td style="font-family:var(--font-mono)">${escHtml(d.domain)}</td>
-                    <td>${d.is_active
-                      ? '<span class="badge badge-green">● 启用</span>'
-                      : '<span class="badge badge-gray">○ 停用</span>'}</td>
-                    <td style="display:flex;gap:0.5rem;align-items:center">
-                      <button class="btn btn-ghost btn-sm" onclick="toggleDomain(${d.id},${!d.is_active})">${d.is_active ? '停用' : '启用'}</button>
-                      <button class="btn btn-danger btn-sm" onclick="confirmDeleteDomain(${d.id},'${escHtml(d.domain)}')">删除</button>
-                    </td>
-                  </tr>
-                `).join('')}
-            </tbody>
-          </table>
-        </div>
+      <div class="domain-sections-grid">
+        ${exactDomainsHtml}
+        ${wildcardDomainsHtml}
       </div>
     </div>
   `;
@@ -1077,6 +2301,47 @@ async function renderAdminDomains(container) {
     startPendingDomainPoller(pending.map(d => d.id));
   }
 }
+
+window.bulkDeleteDomains = async function(selectionKey = 'admin-domains') {
+  await runBulkDelete({
+    selectionKey,
+    itemLabel: '域名',
+    onDelete: id => api.admin.deleteDomain(id),
+    onDone: async () => navigate('admin-domains'),
+  });
+};
+
+window.bulkToggleDomains = function(selectionKey = 'admin-domains', newActive) {
+  const selectedIds = getBulkSelectedIds(selectionKey);
+  if (!selectedIds.length) {
+    toast('请先选择域名', 'warn');
+    return;
+  }
+  const selectedDomains = (state.adminDomains || []).filter(d => selectedIds.includes(String(d.id)));
+  const eligible = selectedDomains.filter(d => d.status !== 'pending');
+  const skipped = selectedDomains.length - eligible.length;
+  if (!eligible.length) {
+    toast('待验证域名不能直接批量启用/停用', 'warn');
+    return;
+  }
+  const actionLabel = newActive ? '启用' : '停用';
+  showModal(`批量${actionLabel}域名`, `<p>确定${actionLabel}选中的 <strong>${eligible.length}</strong> 个域名？${skipped > 0 ? `<br><span style="font-size:0.8rem;color:var(--text-muted)">其中 ${skipped} 个待验证域名会被自动跳过。</span>` : ''}</p>`, async () => {
+    let success = 0;
+    let failed = 0;
+    for (const domain of eligible) {
+      try {
+        await api.admin.toggleDomain(domain.id, newActive);
+        success += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    getBulkSelection(selectionKey).clear();
+    if (success > 0) toast(`已${actionLabel} ${success} 个域名`, 'success');
+    if (failed > 0) toast(`${failed} 个域名${actionLabel}失败`, 'warn');
+    navigate('admin-domains');
+  });
+};
 
 window.showAddDomainModal = function() {
   const old = document.querySelector('.modal-overlay');
@@ -1099,8 +2364,8 @@ window.showAddDomainModal = function() {
       <div id="add-step1">
         <div class="form-group" style="margin-bottom:0.5rem">
           <label class="form-label">域名</label>
-          <input class="form-input" id="add-domain-inp" placeholder="example.com" autofocus />
-          <div class="form-hint">输入将用于接收邮件的顶级域名</div>
+          <input class="form-input" id="add-domain-inp" placeholder="example.com 或 *.example.com" autofocus />
+          <div class="form-hint">支持精确域名和通配子域规则。通配规则如 <code>*.example.com</code>，只覆盖子域，不覆盖根域 <code>example.com</code>。</div>
         </div>
         <div id="add-dns-hint" style="background:var(--bg-secondary);border-radius:6px;padding:0.7rem 0.9rem;margin-bottom:0.8rem;font-size:0.8rem">
           <b>需要配置的 DNS 记录：</b>
@@ -1128,16 +2393,21 @@ window.showAddDomainModal = function() {
   inp?.addEventListener('input', updateDnsHint);
 
   function updateDnsHint() {
-    const d = (inp?.value || '').trim() || 'example.com';
+    const rawDomain = normalizeDomainInput(inp?.value || '') || 'example.com';
+    const wildcard = isWildcardDomainPattern(rawDomain);
+    const baseDomain = wildcard ? (getWildcardBaseDomain(rawDomain) || 'example.com') : rawDomain;
     const ip = serverIP || '&lt;服务器IP&gt;';
-    const hn = serverHostname || 'mail.' + d;
+    const hn = serverHostname || 'mail.' + baseDomain;
     const hasHostname = !!serverHostname;
+    const mxHost = wildcard ? '*' : '@';
+    const txtHost = wildcard ? '*' : '@';
     const tbody = document.getElementById('add-dns-rows');
     if (!tbody) return;
     tbody.innerHTML = `
-      <tr><td style="padding:2px 5px">MX</td><td style="padding:2px 5px;font-family:monospace">@</td><td style="padding:2px 5px;font-family:monospace">${escHtml(hn)}</td><td style="padding:2px 5px">10</td></tr>
-      ${hasHostname ? '' : `<tr><td style="padding:2px 5px">A</td><td style="padding:2px 5px;font-family:monospace">mail.${escHtml(d)}</td><td style="padding:2px 5px;font-family:monospace">${escHtml(ip)}</td><td style="padding:2px 5px">—</td></tr>`}
-      <tr><td style="padding:2px 5px">TXT</td><td style="padding:2px 5px;font-family:monospace">@</td><td style="padding:2px 5px;font-family:monospace">v=spf1 ip4:${escHtml(ip)} ~all</td><td style="padding:2px 5px">—</td></tr>
+      <tr><td style="padding:2px 5px">MX</td><td style="padding:2px 5px;font-family:monospace">${mxHost}</td><td style="padding:2px 5px;font-family:monospace">${escHtml(hn)}</td><td style="padding:2px 5px">10</td></tr>
+      ${hasHostname ? '' : `<tr><td style="padding:2px 5px">A</td><td style="padding:2px 5px;font-family:monospace">mail.${escHtml(baseDomain)}</td><td style="padding:2px 5px;font-family:monospace">${escHtml(ip)}</td><td style="padding:2px 5px">—</td></tr>`}
+      <tr><td style="padding:2px 5px">TXT</td><td style="padding:2px 5px;font-family:monospace">${txtHost}</td><td style="padding:2px 5px;font-family:monospace">v=spf1 ip4:${escHtml(ip)} ~all</td><td style="padding:2px 5px">—</td></tr>
+      ${wildcard ? `<tr><td colspan="4" style="padding:6px 5px 2px;color:var(--text-muted)">提示：该通配规则不覆盖根域 <code>${escHtml(baseDomain)}</code>，如需接收 <code>@${escHtml(baseDomain)}</code> 请额外再添加一次精确域名。</td></tr>` : ''}
     `;
   }
   updateDnsHint();
@@ -1256,16 +2526,32 @@ window.confirmDeleteDomain = function(id, name) {
 // ─── Admin: 系统设置 ─────────────────────────────────────────
 async function renderAdminSettings(container) {
   let settings = {};
-  try { settings = await api.admin.getSettings(); } catch {}
+  let accounts = [];
+  try {
+    [settings, accounts] = await Promise.all([
+      api.admin.getSettings(),
+      api.admin.listAccounts(),
+    ]);
+  } catch {
+    try { settings = await api.admin.getSettings(); } catch {}
+    try { accounts = await api.admin.listAccounts(); } catch {}
+  }
 
   const regOpen    = settings.registration_open === 'true' || settings.registration_open === true;
   const smtpIp      = settings.smtp_server_ip       || '';
   const smtpHostname = settings.smtp_hostname         || '';
-  const siteTitle  = settings.site_title            || 'TempMail';
+  const siteTitle  = settings.site_title            || DEFAULT_SITE_TITLE;
+  const siteLogo   = settings.site_logo             || DEFAULT_SITE_LOGO;
+  const siteSubtitle = settings.site_subtitle       || DEFAULT_SITE_SUBTITLE;
   const defDomain  = settings.default_domain        || '';
   const ttlMins    = settings.mailbox_ttl_minutes   || '30';
   const announce   = settings.announcement          || '';
   const maxMb      = settings.max_mailboxes_per_user|| '5';
+  const reservedMailboxAddresses = settings.reserved_mailbox_addresses ?? DEFAULT_RESERVED_MAILBOX_ADDRESSES;
+  const subdomainWordlist = settings.subdomain_wordlist || '';
+  const unknownPolicy = settings.unknown_recipient_policy || 'claimable';
+  const catchallAdminId = settings.catchall_admin_account_id || '';
+  const adminAccounts = (accounts || []).filter(a => a.is_admin && a.is_active && !a.is_system);
 
   function inputRow(id, label, value, hint, placeholder = '', settingKey = '') {
     const key = settingKey || id.replace(/^input-/, '').replace(/-/g, '_');
@@ -1302,6 +2588,14 @@ async function renderAdminSettings(container) {
         ${inputRow('input-site-title', '站点名称', siteTitle, '显示在标题栏和登录页', 'TempMail')}
         <div class="divider"></div>
 
+        <!-- 站点 Logo -->
+        ${inputRow('input-site-logo', '站点 Logo', siteLogo, '支持 emoji 或 1-2 个字符，显示在登录页和侧边栏品牌位', '✉', 'site_logo')}
+        <div class="divider"></div>
+
+        <!-- 站点副标题 -->
+        ${inputRow('input-site-subtitle', '站点副标题', siteSubtitle, '显示在登录页标题下方与侧边栏品牌描述', '临时邮箱服务 · 安全隔离 · 按需分配', 'site_subtitle')}
+        <div class="divider"></div>
+
         <!-- 公告 -->
         <div class="form-group">
           <label class="form-label">公告内容</label>
@@ -1326,11 +2620,65 @@ async function renderAdminSettings(container) {
         <div class="divider"></div>
 
         <!-- 邮箱 TTL -->
-        ${inputRow('input-mailbox-ttl-minutes', '邮箱有效期（分钟）', ttlMins, '新建邮箱的默认存活时间，0 = 永不过期', '30')}
+        ${inputRow('input-mailbox-ttl-minutes', '邮箱有效期（分钟）', ttlMins, '仅对临时邮箱生效；永久邮箱不会自动过期', '30')}
         <div class="divider"></div>
 
         <!-- 每用户邮箱上限 -->
         ${inputRow('input-max-mailboxes-per-user', '每账户邮箱上限', maxMb, '每个账户同时存在的邮箱数量上限', '5')}
+        <div class="divider"></div>
+
+        <!-- 保留邮箱前缀 -->
+        <div class="form-group">
+          <label class="form-label">普通用户保留地址</label>
+          <div style="display:flex;gap:0.5rem">
+            <textarea class="form-input" id="input-reserved-mailbox-addresses" rows="6" placeholder="每行一个本地部分，如 admin" style="flex:1;resize:vertical">${escHtml(reservedMailboxAddresses)}</textarea>
+            <button class="btn btn-primary btn-sm" onclick="saveSetting('input-reserved-mailbox-addresses','reserved_mailbox_addresses')" style="align-self:flex-start">✓ 保存</button>
+          </div>
+          <div class="form-hint">这些邮箱前缀仅管理员可创建。支持换行、逗号、空格或分号分隔；留空表示不保留任何特殊地址。</div>
+        </div>
+        <div class="divider"></div>
+
+        <!-- 通配子域词库 -->
+        <div class="form-group">
+          <label class="form-label">通配子域词库（wordlist 模式）</label>
+          <div style="display:flex;gap:0.5rem">
+            <textarea class="form-input" id="input-subdomain-wordlist" rows="10" placeholder="每行一个完整子域标签，如 api 或 support-center" style="flex:1;resize:vertical">${escHtml(subdomainWordlist)}</textarea>
+            <button class="btn btn-primary btn-sm" onclick="saveSetting('input-subdomain-wordlist','subdomain_wordlist')" style="align-self:flex-start">✓ 保存</button>
+          </div>
+          <div class="form-hint">用于通配域名的“词库随机”模式。建议填写常见完整子域标签，例如 <code>api</code>、<code>auth-center</code>、<code>support-hub</code>。支持换行、逗号、空格或分号分隔；留空会回退到内置默认词库。</div>
+        </div>
+        <div class="divider"></div>
+
+        <!-- 未知收件人策略 -->
+        <div class="form-group">
+          <label class="form-label">未知收件人处理方式</label>
+          <div style="display:flex;gap:0.5rem">
+            <select class="form-input" id="input-unknown-recipient-policy" style="flex:1">
+              <option value="claimable" ${unknownPolicy === 'claimable' ? 'selected' : ''}>弱所有权：自动存入 catch-all，后续可认领</option>
+              <option value="admin_only" ${unknownPolicy === 'admin_only' ? 'selected' : ''}>管理员 catch-all：普通用户不可认领</option>
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="saveSetting('input-unknown-recipient-policy','unknown_recipient_policy')">✓ 保存</button>
+          </div>
+        <div class="form-hint">claimable 适合 temp-mail 式使用；admin_only 会把新出现的未知地址邮件转交给最早创建的活跃管理员账户。</div>
+        </div>
+        <div class="divider"></div>
+
+        <!-- Catch-all 管理员 -->
+        <div class="form-group">
+          <label class="form-label">指定 Catch-all 管理员</label>
+          <div style="display:flex;gap:0.5rem">
+            <select class="form-input" id="input-catchall-admin-account-id" style="flex:1">
+              <option value="">自动选择最早创建的活跃管理员</option>
+              ${adminAccounts.map(acc => `
+                <option value="${escHtml(acc.id)}" ${catchallAdminId === acc.id ? 'selected' : ''}>
+                  ${escHtml(acc.username)}${acc.id === state.account?.id ? '（当前账号）' : ''}
+                </option>
+              `).join('')}
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="saveSetting('input-catchall-admin-account-id','catchall_admin_account_id')">✓ 保存</button>
+          </div>
+          <div class="form-hint">仅在 admin_only 模式生效。留空时，系统自动选用最早创建的活跃管理员。</div>
+        </div>
         <div class="divider"></div>
 
         <!-- 服务信息 -->
@@ -1366,6 +2714,21 @@ window.saveSetting = async function(inputId, settingKey) {
   const val = el2 ? (el2.tagName === 'TEXTAREA' ? el2.value : el2.value.trim()) : '';
   try {
     await api.admin.saveSettings({ [settingKey]: val });
+    if (['site_title', 'site_logo', 'site_subtitle'].includes(settingKey)) {
+      state.publicSettings = {
+        ...(state.publicSettings || {}),
+        [settingKey]: val || (
+          settingKey === 'site_title' ? DEFAULT_SITE_TITLE :
+          settingKey === 'site_logo' ? DEFAULT_SITE_LOGO :
+          DEFAULT_SITE_SUBTITLE
+        ),
+      };
+      applySiteBranding(
+        state.publicSettings.site_title,
+        state.publicSettings.site_logo,
+        state.publicSettings.site_subtitle,
+      );
+    }
     toast('已保存', 'success');
   } catch(e) { toast('保存失败: ' + e.message, 'error'); }
 };
@@ -1420,11 +2783,23 @@ let _inboxPollerTimer   = null;
 function clearInboxPoller() {
   if (_inboxPollerTimer) { clearInterval(_inboxPollerTimer); _inboxPollerTimer = null; }
 }
+function clearPendingDomainPoller() {
+  if (_pendingPollerTimer) { clearInterval(_pendingPollerTimer); _pendingPollerTimer = null; }
+}
 function startPendingDomainPoller(ids) {
-  if (!ids || ids.length === 0) return;
-  clearInterval(_pendingPollerTimer);
+  if (!ids || ids.length === 0) {
+    clearPendingDomainPoller();
+    return;
+  }
+  clearPendingDomainPoller();
   const remaining = new Set(ids);
   _pendingPollerTimer = setInterval(async () => {
+    if (!['domains-guide', 'admin-domains'].includes(state.page)) {
+      clearPendingDomainPoller();
+      return;
+    }
+    if (document.hidden) return;
+
     for (const id of [...remaining]) {
       try {
         const d = await api.getDomainStatus(id); // 使用非管理员接口
@@ -1433,6 +2808,8 @@ function startPendingDomainPoller(ids) {
         if (d.status === 'active') {
           if (statusEl) statusEl.innerHTML = '<span class="badge badge-green">✓ 已激活</span>';
           remaining.delete(id);
+          getBulkSelection('admin-domains').delete(String(id));
+          updateBulkUI('admin-domains');
           toast(`✓ 域名 ${d.domain} MX验证通过，已加入域名池`, 'success');
           setTimeout(() => { if (rowEl) rowEl.remove(); }, 3000);
         } else if (statusEl) {
@@ -1441,8 +2818,8 @@ function startPendingDomainPoller(ids) {
         }
       } catch {}
     }
-    if (remaining.size === 0) clearInterval(_pendingPollerTimer);
-  }, 5000);
+    if (remaining.size === 0) clearPendingDomainPoller();
+  }, 15000);
 }
 
 window.showMXRegisterModal = function() {
@@ -1455,11 +2832,11 @@ window.showMXRegisterModal = function() {
       <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button>
       <p style="font-size:0.82rem;color:var(--text-secondary);margin:0.5rem 0 0.8rem">
         提交域名后系统立即检测 MX 记录。若已配置则直接激活；
-        否则进入待验证队列，后台每 <b>30 秒</b>自动重试，无需手动确认。
+        否则进入待验证队列，后台每 <b>30 秒</b>自动重试，无需手动确认。也支持提交 <code>*.example.com</code> 这样的通配子域规则。
       </p>
       <div class="form-group">
-        <label class="form-label">域名（如 example.com）</label>
-        <input class="form-input" id="mxr-domain" placeholder="example.com" autofocus />
+        <label class="form-label">域名 / 通配规则（如 example.com 或 *.example.com）</label>
+        <input class="form-input" id="mxr-domain" placeholder="example.com 或 *.example.com" autofocus />
       </div>
       <div id="mxr-dns-hint" style="display:none;background:var(--bg-secondary);border-radius:6px;padding:0.7rem 0.9rem;margin-bottom:0.6rem;font-size:0.8rem">
         <b>请在 DNS 管理面板添加以下记录：</b>
@@ -1543,6 +2920,7 @@ window.showMXRegisterModal = function() {
     const timer = setInterval(async () => {
       attempts++;
       if (!document.body.contains(modal)) { clearInterval(timer); return; }
+      if (document.hidden) return;
       try {
         const d = await api.getDomainStatus(domainId); // 非管理员接口
         if (d.status === 'active') {
@@ -1561,7 +2939,7 @@ window.showMXRegisterModal = function() {
             </div>`;
         }
       } catch {}
-    }, 5000);
+    }, 15000);
   }
 };
 
@@ -1580,8 +2958,28 @@ curl -H "Authorization: Bearer ${key}" ${base}/api/me
 curl "${base}/api/me?api_key=${key}"`,
     },
     {
-      title: '📫 1. 创建临时邮箱',
-      desc: 'POST /api/mailboxes — address 和 domain 均为可选字段',
+      title: '🌐 域名参数说明',
+      desc: 'domain 支持根域、普通子域和通配规则；不要求必须是注册意义上的顶级域。',
+      code: `# 下面这些都可以作为合法示例（前提：已在系统中激活，且 DNS 由你控制）
+example.com
+mail.example.com
+relay.mail.example.net
+*.example.com
+*.mail.example.net
+
+# 匹配关系
+mail.example.com     -> 只匹配 @mail.example.com
+*.mail.example.net   -> 匹配 @a.mail.example.net
+*.mail.example.net   -> 也匹配 @b.c.mail.example.net
+*.mail.example.net   -> 不匹配 @mail.example.net
+
+# 如果你想同时接收 @mail.example.net 和任意更深子域：
+mail.example.net
+*.mail.example.net`,
+    },
+    {
+      title: '📫 1. 创建邮箱（临时 / 永久）',
+      desc: 'POST /api/mailboxes — address、domain、permanent、auto_subdomain、subdomain_mode 均可选；若地址是 catch-all 暂存地址，响应会返回 claimed=true',
       code: `# 随机地址 + 随机域名
 curl -s -X POST ${base}/api/mailboxes \\
   -H "Authorization: Bearer ${key}" \\
@@ -1606,10 +3004,84 @@ curl -s -X POST ${base}/api/mailboxes \\
   -H "Content-Type: application/json" \\
   -d '{"address": "mytestbox", "domain": "example.com"}'
 
+# 创建永久邮箱（普通用户受永久额度限制，管理员无限制）
+curl -s -X POST ${base}/api/mailboxes \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"address": "vipbox", "domain": "example.com", "permanent": true}'
+
+# 在通配规则 *.example.com 下创建真实子域邮箱
+curl -s -X POST ${base}/api/mailboxes \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"address": "hello", "domain": "demo.example.com"}'
+
+# 使用一个普通子域名作为精确收件域
+curl -s -X POST ${base}/api/mailboxes \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"address": "ops", "domain": "mail.example.net"}'
+
+# 在通配规则 *.example.com 下自动分配随机真实子域
+curl -s -X POST ${base}/api/mailboxes \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"address": "hello", "domain": "*.example.com", "auto_subdomain": true, "subdomain_mode": "random"}'
+
+# 在通配规则 *.example.com 下按词库随机分配真实子域
+curl -s -X POST ${base}/api/mailboxes \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"address": "hello", "domain": "*.example.com", "auto_subdomain": true, "subdomain_mode": "wordlist"}'
+
+# 在 *.mail.example.net 下自动分配随机真实子域
+curl -s -X POST ${base}/api/mailboxes \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"address": "hello", "domain": "*.mail.example.net", "auto_subdomain": true}'
+
+# 响应中会额外带上 auto_subdomain=true、subdomain_mode 和 generated_domain
+# random 示例：hello@k8m2p4xz.example.com
+# wordlist 示例：hello@support-center.example.com
+# wordlist 词库可在后台“系统设置”里直接编辑
+
 # 错误码：
 #   400 → domain 不存在或未激活
-#   409 → 地址已被占用（换一个 address 或留空让系统随机生成）
+#   403 → 地址前缀属于管理员保留地址（如 admin / noreply）
+#   201 + claimed=true → 已认领 catch-all 地址
+#   409 → 地址已被占用，或普通用户永久邮箱额度已用完
 #   503 → 系统内无可用域名`,
+    },
+    {
+      title: '🌍 域名提交 / MX 验证',
+      desc: 'POST /api/domains/submit — 登录用户可提交根域、普通子域或 wildcard 规则，系统会自动检查 MX 并异步激活。',
+      code: `# 提交根域
+curl -s -X POST ${base}/api/domains/submit \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"domain": "example.com"}'
+
+# 提交普通子域（不是根域也可以）
+curl -s -X POST ${base}/api/domains/submit \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"domain": "mail.example.net"}'
+
+# 提交通配规则
+curl -s -X POST ${base}/api/domains/submit \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"domain": "*.example.com"}'
+
+# 提交子域上的通配规则
+curl -s -X POST ${base}/api/domains/submit \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"domain": "*.mail.example.net"}'
+
+# 查询状态
+curl -s ${base}/api/domains/<domain-id>/status \\
+  -H "Authorization: Bearer ${key}"`,
     },
     {
       title: '📌 2. 获取邮箱列表',
@@ -1691,7 +3163,75 @@ curl -s -X DELETE $BASE/api/mailboxes/$MB_ID \\
 echo "✓ 邮箱已删除"`,
     },
     {
-      title: '📈 8. 并发压测示例（wrk）',
+      title: '👑 8. 管理员：切换账户管理员身份',
+      desc: 'PUT /api/admin/accounts/:id/admin',
+      code: `ACCOUNT_ID="目标账户UUID"
+curl -s -X PUT ${base}/api/admin/accounts/$ACCOUNT_ID/admin \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"is_admin": true}'
+
+# 解除管理员
+curl -s -X PUT ${base}/api/admin/accounts/$ACCOUNT_ID/admin \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"is_admin": false}'`,
+    },
+    {
+      title: '🧮 9. 管理员：调整普通用户永久邮箱额度',
+      desc: 'PUT /api/admin/accounts/:id/quota',
+      code: `ACCOUNT_ID="目标账户UUID"
+curl -s -X PUT ${base}/api/admin/accounts/$ACCOUNT_ID/quota \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"permanent_mailbox_quota": 12}'`,
+    },
+    {
+      title: '📥 10. 管理员：Catch-all 收件箱',
+      desc: '查看所有未预创建地址生成的 catch-all 邮箱及邮件',
+      code: `# 列出所有 catch-all 邮箱
+curl -s ${base}/api/admin/catchall/mailboxes \\
+  -H "Authorization: Bearer ${key}"
+
+MAILBOX_ID="catch-all 邮箱UUID"
+
+# 查看该地址下的邮件列表
+curl -s ${base}/api/admin/catchall/mailboxes/$MAILBOX_ID/emails \\
+  -H "Authorization: Bearer ${key}"
+
+EMAIL_ID="邮件UUID"
+
+# 查看单封邮件
+curl -s ${base}/api/admin/catchall/mailboxes/$MAILBOX_ID/emails/$EMAIL_ID \\
+  -H "Authorization: Bearer ${key}"
+
+# 删除整条 catch-all 地址及其邮件
+curl -s -X DELETE ${base}/api/admin/catchall/mailboxes/$MAILBOX_ID \\
+  -H "Authorization: Bearer ${key}"`,
+    },
+    {
+      title: '⚙ 11. 管理员：Catch-all / 保留地址设置',
+      desc: '通过系统设置切换弱所有权 / 管理员专属模式，指定接收管理员，或配置普通用户不可注册的保留地址',
+      code: `# 弱所有权模式：未知地址进入系统 _catchall，可被后续认领
+curl -s -X PUT ${base}/api/admin/settings \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"unknown_recipient_policy":"claimable","catchall_admin_account_id":""}'
+
+# 管理员专属模式：指定某个管理员作为 catch-all 接收者
+curl -s -X PUT ${base}/api/admin/settings \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"unknown_recipient_policy":"admin_only","catchall_admin_account_id":"<admin-uuid>"}'
+
+# 配置普通用户不可创建的保留地址（仅管理员可注册）
+curl -s -X PUT ${base}/api/admin/settings \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"reserved_mailbox_addresses":"admin\\nnoreply\\npostmaster\\nsecurity"}'`,
+    },
+    {
+      title: '📈 12. 并发压测示例（wrk）',
       desc: '对注册接口进行高并发压测，500 并发，持续 30 秒',
       code: `# 安装 wrk: apt install wrk
 
@@ -1749,8 +3289,9 @@ k6 run /tmp/test.js`,
 }
 
 // ─── 启动 ──────────────────────────────────────────────────
-function init() {
-  applyTheme(state.theme);
+async function init() {
+  applyTheme(state.theme, { persist: false });
+  await loadPublicSettings();
 
   if (state.apiKey && state.account) {
     showMainLayout();

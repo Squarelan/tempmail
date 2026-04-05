@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -37,7 +40,7 @@ func main() {
 		Addr:         cfg.RedisAddr,
 		Password:     cfg.RedisPassword,
 		DB:           0,
-		PoolSize:     0,      // 0 = 不限（自动按 CPU 核心数 * 10）
+		PoolSize:     0, // 0 = 不限（自动按 CPU 核心数 * 10）
 		MinIdleConns: 20,
 		DialTimeout:  3 * time.Second,
 		ReadTimeout:  2 * time.Second,
@@ -56,11 +59,11 @@ func main() {
 
 	// CORS：允许前端跨域访问
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-		ExposeHeaders:    []string{"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"},
-		MaxAge:           12 * time.Hour,
+		AllowOrigins:  []string{"*"},
+		AllowMethods:  []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders:  []string{"Origin", "Content-Type", "Authorization"},
+		ExposeHeaders: []string{"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"},
+		MaxAge:        12 * time.Hour,
 	}))
 
 	// 健康检查（无需认证）
@@ -70,12 +73,13 @@ func main() {
 
 	// 初始化 handlers
 	accountH := handler.NewAccountHandler(db)
-	domainH  := handler.NewDomainHandler(db, cfg.SMTPServerIP, cfg.SMTPHostname)
+	domainH := handler.NewDomainHandler(db, cfg.SMTPServerIP, cfg.SMTPHostname)
 	mailboxH := handler.NewMailboxHandler(db)
-	emailH   := handler.NewEmailHandler(db)
+	emailH := handler.NewEmailHandler(db)
+	catchallH := handler.NewCatchallHandler(db)
 	settingH := handler.NewSettingHandler(db)
 	registerH := handler.NewRegisterHandler(db)
-	statsH   := handler.NewStatsHandler(db)
+	statsH := handler.NewStatsHandler(db)
 
 	// 公开路由（无需认证）
 	public := r.Group("/public")
@@ -106,9 +110,9 @@ func main() {
 		api.DELETE("/mailboxes/:id", mailboxH.Delete)
 
 		// 邮件管理
-                api.GET("/mailboxes/:id/emails", emailH.List)
-                api.GET("/mailboxes/:id/emails/:email_id", emailH.Get)
-                api.DELETE("/mailboxes/:id/emails/:email_id", emailH.Delete)
+		api.GET("/mailboxes/:id/emails", emailH.List)
+		api.GET("/mailboxes/:id/emails/:email_id", emailH.Get)
+		api.DELETE("/mailboxes/:id/emails/:email_id", emailH.Delete)
 		// 管理员路由
 		admin := api.Group("/admin")
 		admin.Use(middleware.AdminOnly())
@@ -116,6 +120,14 @@ func main() {
 			admin.POST("/accounts", accountH.Create)
 			admin.GET("/accounts", accountH.List)
 			admin.DELETE("/accounts/:id", accountH.Delete)
+			admin.PUT("/accounts/:id/admin", accountH.SetAdmin)
+			admin.PUT("/accounts/:id/quota", accountH.SetPermanentQuota)
+
+			admin.GET("/catchall/mailboxes", catchallH.ListMailboxes)
+			admin.DELETE("/catchall/mailboxes/:id", catchallH.DeleteMailbox)
+			admin.GET("/catchall/mailboxes/:id/emails", catchallH.ListEmails)
+			admin.GET("/catchall/mailboxes/:id/emails/:email_id", catchallH.GetEmail)
+			admin.DELETE("/catchall/mailboxes/:id/emails/:email_id", catchallH.DeleteEmail)
 
 			admin.POST("/domains", domainH.Add)
 			admin.DELETE("/domains/:id", domainH.Delete)
@@ -157,11 +169,59 @@ func main() {
 				return
 			}
 
-			// 查找收件邮箱
-			mailbox, err := db.GetMailboxByFullAddress(c.Request.Context(), req.Recipient)
+			recipient := normalizeEmailAddress(req.Recipient)
+			localPart, domainName, ok := splitEmailAddress(recipient)
+			if !ok {
+				c.JSON(http.StatusOK, gin.H{"status": "discarded", "reason": "invalid recipient"})
+				return
+			}
+
+			domainRecord, err := db.ResolveActiveDomain(c.Request.Context(), domainName)
 			if err != nil {
-				// 邮箱不存在，静默丢弃
-				c.JSON(http.StatusOK, gin.H{"status": "discarded", "reason": "unknown recipient"})
+				c.JSON(http.StatusOK, gin.H{"status": "discarded", "reason": "inactive domain"})
+				return
+			}
+
+			ttlMinutes := db.GetMailboxTTLMinutes(c.Request.Context())
+			policy := db.GetUnknownRecipientPolicy(c.Request.Context())
+
+			// 查找收件邮箱；不存在时按 catch-all 规则自动建箱
+			mailbox, err := db.GetMailboxByFullAddress(c.Request.Context(), recipient)
+			switch {
+			case err == nil:
+				if mailbox.IsCatchall {
+					if policy == store.UnknownRecipientPolicyAdminOnly {
+						owner, ownerErr := db.ResolveUnknownRecipientOwner(c.Request.Context(), policy)
+						if ownerErr != nil {
+							c.JSON(http.StatusInternalServerError, gin.H{"error": ownerErr.Error()})
+							return
+						}
+						if mailbox.AccountID != owner.ID {
+							mailbox, err = db.ReassignCatchallMailbox(c.Request.Context(), mailbox.ID, owner.ID, ttlMinutes)
+						} else {
+							mailbox, err = db.RefreshCatchallMailbox(c.Request.Context(), mailbox.ID, ttlMinutes)
+						}
+					} else {
+						mailbox, err = db.RefreshCatchallMailbox(c.Request.Context(), mailbox.ID, ttlMinutes)
+					}
+					if err != nil {
+						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+						return
+					}
+				}
+			case errors.Is(err, pgx.ErrNoRows):
+				owner, ownerErr := db.ResolveUnknownRecipientOwner(c.Request.Context(), policy)
+				if ownerErr != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": ownerErr.Error()})
+					return
+				}
+				mailbox, err = db.UpsertCatchallMailbox(c.Request.Context(), owner.ID, localPart, domainRecord.ID, recipient, ttlMinutes)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					return
+				}
+			default:
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 
@@ -210,10 +270,7 @@ func main() {
 				if len(pendingDomains) == 0 {
 					continue
 				}
-				serverIP := cfg.SMTPServerIP
-				if serverIP == "" {
-					serverIP, _ = db.GetSetting(context.Background(), "smtp_server_ip")
-				}
+				serverIP := db.GetSMTPServerIP(context.Background(), cfg.SMTPServerIP)
 				for _, d := range pendingDomains {
 					matched, _, mxStatus := store.CheckDomainMX(d.Domain, serverIP)
 					db.TouchDomainCheckTime(context.Background(), d.ID)
@@ -235,10 +292,7 @@ func main() {
 					log.Printf("[mx-recheck] list active error: %v", err)
 					continue
 				}
-				serverIP := cfg.SMTPServerIP
-				if serverIP == "" {
-					serverIP, _ = db.GetSetting(context.Background(), "smtp_server_ip")
-				}
+				serverIP := db.GetSMTPServerIP(context.Background(), cfg.SMTPServerIP)
 				log.Printf("[mx-recheck] checking %d active domains", len(activeDomains))
 				for _, d := range activeDomains {
 					matched, _, mxStatus := store.CheckDomainMX(d.Domain, serverIP)
@@ -307,4 +361,19 @@ func main() {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 	log.Println("Server exited")
+}
+
+func normalizeEmailAddress(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func splitEmailAddress(value string) (localPart string, domain string, ok bool) {
+	localPart, domain, ok = strings.Cut(normalizeEmailAddress(value), "@")
+	if !ok || localPart == "" || domain == "" {
+		return "", "", false
+	}
+	if strings.Contains(localPart, "@") || strings.Contains(domain, "@") {
+		return "", "", false
+	}
+	return localPart, domain, true
 }

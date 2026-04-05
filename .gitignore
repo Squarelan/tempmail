@@ -1,6 +1,9 @@
 # 环境配置（含密码/IP等敏感信息）
 .env
 
+# 本地 AI / IDE 会话状态
+.omc/
+
 # 运行时数据（admin key 等）
 data/
 

@@ -14,9 +14,9 @@ import (
 )
 
 type DomainHandler struct {
-	store        *store.Store
-	cfgIP        string // SMTP_SERVER_IP env
-	cfgHostname  string // SMTP_HOSTNAME env
+	store       *store.Store
+	cfgIP       string // SMTP_SERVER_IP env
+	cfgHostname string // SMTP_HOSTNAME env
 }
 
 func NewDomainHandler(s *store.Store, smtpIP, smtpHostname string) *DomainHandler {
@@ -25,19 +25,65 @@ func NewDomainHandler(s *store.Store, smtpIP, smtpHostname string) *DomainHandle
 
 // getServerIP 优先读 DB 设置，其次环境变量传入的值
 func (h *DomainHandler) getServerIP(ctx context.Context) string {
-	if ip, err := h.store.GetSetting(ctx, "smtp_server_ip"); err == nil && ip != "" {
-		return ip
-	}
-	return h.cfgIP
+	return h.store.GetSMTPServerIP(ctx, h.cfgIP)
 }
 
 // getServerHostname 返回 MX 记录应指向的邮件服务器 hostname
 // 优先: DB 设置 smtp_hostname → 环境变量 → 空串（傻用 mail.提交域名 方式）
 func (h *DomainHandler) getServerHostname(ctx context.Context) string {
-	if hn, err := h.store.GetSetting(ctx, "smtp_hostname"); err == nil && hn != "" {
-		return hn
+	return h.store.GetSMTPHostname(ctx, h.cfgHostname)
+}
+
+func (h *DomainHandler) buildDNSRecords(domain, serverIP, hostname string) []gin.H {
+	isWildcard := store.IsWildcardDomain(domain)
+	baseDomain := domain
+	mxHost := "@"
+	txtHost := "@"
+
+	if isWildcard {
+		baseDomain = store.WildcardBaseDomain(domain)
+		mxHost = "*"
+		txtHost = "*"
 	}
-	return h.cfgHostname
+
+	mxValue := hostname
+	if mxValue == "" {
+		mxValue = fmt.Sprintf("mail.%s", baseDomain)
+	}
+
+	records := []gin.H{
+		{"type": "MX", "host": mxHost, "value": mxValue, "priority": 10, "description": "邮件交换记录，指向本服务器"},
+	}
+
+	if hostname == "" {
+		records = append(records, gin.H{
+			"type":        "A",
+			"host":        fmt.Sprintf("mail.%s", baseDomain),
+			"value":       serverIP,
+			"description": "邮件服务器 A 记录",
+		})
+	}
+
+	records = append(records, gin.H{
+		"type":        "TXT",
+		"host":        txtHost,
+		"value":       fmt.Sprintf("v=spf1 ip4:%s ~all", serverIP),
+		"description": "SPF 记录（可选）",
+	})
+
+	return records
+}
+
+func (h *DomainHandler) buildDomainInstructions(domain string) string {
+	if store.IsWildcardDomain(domain) {
+		baseDomain := store.WildcardBaseDomain(domain)
+		return fmt.Sprintf(
+			"请在域名 %s 的 DNS 管理面板中为通配子域规则 %s 添加以上记录。这样任意子域（如 inbox.%s、a.b.%s）都能收信；根域 %s 本身不会被该规则覆盖，如需接收 @%s 请额外再添加一个精确域名。",
+			baseDomain, domain, baseDomain, baseDomain, baseDomain, baseDomain,
+		)
+	}
+
+	return fmt.Sprintf("请在域名 %s 的 DNS 管理面板中添加以上记录。添加后约 5-30 分钟生效。", domain)
 }
 
 // POST /api/admin/domains - 添加域名到池（管理员）
@@ -50,7 +96,13 @@ func (h *DomainHandler) Add(c *gin.Context) {
 		return
 	}
 
-	domain, err := h.store.AddDomain(c.Request.Context(), req.Domain)
+	normalizedDomain, err := store.NormalizeManagedDomain(req.Domain)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	domain, err := h.store.AddDomain(c.Request.Context(), normalizedDomain)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "domain already exists: " + err.Error()})
 		return
@@ -59,29 +111,13 @@ func (h *DomainHandler) Add(c *gin.Context) {
 	// 获取服务器 IP 和 hostname（来自 DB 设置或环境变量）
 	serverIP := h.getServerIP(c.Request.Context())
 	hostname := h.getServerHostname(c.Request.Context())
-
-	// 构建 DNS 指引
-	var dnsRecords []gin.H
-	if hostname != "" {
-		dnsRecords = []gin.H{
-			{"type": "MX",  "host": "@", "value": hostname, "priority": 10, "description": "邮件交换记录，指向本服务器"},
-			{"type": "TXT", "host": "@", "value": fmt.Sprintf("v=spf1 ip4:%s ~all", serverIP), "description": "SPF 记录（可选）"},
-		}
-	} else {
-		dnsRecords = []gin.H{
-			{"type": "MX",  "host": "@", "value": fmt.Sprintf("mail.%s", req.Domain), "priority": 10, "description": "邮件交换记录"},
-			{"type": "A",   "host": fmt.Sprintf("mail.%s", req.Domain), "value": serverIP, "description": "邮件服务器 A 记录"},
-			{"type": "TXT", "host": "@", "value": fmt.Sprintf("v=spf1 ip4:%s ~all", serverIP), "description": "SPF 记录（可选）"},
-		}
-	}
+	dnsRecords := h.buildDNSRecords(normalizedDomain, serverIP, hostname)
 
 	// 返回 DNS 配置指引
 	c.JSON(http.StatusCreated, gin.H{
-		"domain":      domain,
-		"dns_records": dnsRecords,
-		"instructions": fmt.Sprintf(
-			"请在域名 %s 的 DNS 管理面板中添加以上记录。添加后约 5-30 分钟生效。",
-			req.Domain),
+		"domain":       domain,
+		"dns_records":  dnsRecords,
+		"instructions": h.buildDomainInstructions(normalizedDomain),
 	})
 }
 
@@ -149,7 +185,12 @@ func (h *DomainHandler) MXImport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	req.Domain = strings.ToLower(strings.TrimSpace(req.Domain))
+	normalizedDomain, err := store.NormalizeManagedDomain(req.Domain)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.Domain = normalizedDomain
 
 	// 获取服务器 IP / hostname（来自 DB 设置或环境变量，不内置硬编码）
 	serverIP := h.getServerIP(c.Request.Context())
@@ -159,20 +200,7 @@ func (h *DomainHandler) MXImport(c *gin.Context) {
 	matched, mxHosts, mxStatus := store.CheckDomainMX(req.Domain, serverIP)
 
 	if !matched && !req.Force {
-		var dnsHint []gin.H
-		if hostname != "" {
-			dnsHint = []gin.H{
-				{"type": "MX", "host": "@", "value": hostname, "priority": 10},
-				{"type": "TXT", "host": "@", "value": fmt.Sprintf("v=spf1 ip4:%s ~all", serverIP)},
-			}
-		} else {
-			mailSub := fmt.Sprintf("mail.%s", req.Domain)
-			dnsHint = []gin.H{
-				{"type": "MX", "host": "@", "value": mailSub, "priority": 10},
-				{"type": "A", "host": mailSub, "value": serverIP},
-				{"type": "TXT", "host": "@", "value": fmt.Sprintf("v=spf1 ip4:%s ~all", serverIP)},
-			}
-		}
+		dnsHint := h.buildDNSRecords(req.Domain, serverIP, hostname)
 		c.JSON(http.StatusUnprocessableEntity, gin.H{
 			"error":     "MX检测未通过，如确定要导入请加 force:true",
 			"mx_status": mxStatus,
@@ -213,25 +241,16 @@ func (h *DomainHandler) MXRegister(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	req.Domain = strings.ToLower(strings.TrimSpace(req.Domain))
-
-	serverIP  := h.getServerIP(c.Request.Context())
-	hostname  := h.getServerHostname(c.Request.Context())
-
-	// MX 目标: 优先用服务器自己的 hostname，否则用用户域名的 mail 子域
-	mxTarget := fmt.Sprintf("mail.%s", req.Domain)
-	dnsRequired := []gin.H{
-		{"type": "MX", "host": "@", "value": mxTarget, "priority": 10},
-		{"type": "A",  "host": mxTarget, "value": serverIP},
-		{"type": "TXT", "host": "@", "value": fmt.Sprintf("v=spf1 ip4:%s ~all", serverIP)},
+	normalizedDomain, err := store.NormalizeManagedDomain(req.Domain)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
-	if hostname != "" {
-		mxTarget = hostname
-		dnsRequired = []gin.H{
-			{"type": "MX", "host": "@", "value": hostname, "priority": 10},
-			{"type": "TXT", "host": "@", "value": fmt.Sprintf("v=spf1 ip4:%s ~all", serverIP)},
-		}
-	}
+	req.Domain = normalizedDomain
+
+	serverIP := h.getServerIP(c.Request.Context())
+	hostname := h.getServerHostname(c.Request.Context())
+	dnsRequired := h.buildDNSRecords(req.Domain, serverIP, hostname)
 
 	// 先尝试立即检测；通过则直接激活
 	matched, _, mxStatus := store.CheckDomainMX(req.Domain, serverIP)
@@ -309,4 +328,3 @@ func (h *DomainHandler) GetStatus(c *gin.Context) {
 		"mx_checked_at": domain.MxCheckedAt,
 	})
 }
-

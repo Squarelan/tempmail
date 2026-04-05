@@ -33,16 +33,17 @@ func (h *RegisterHandler) Register(c *gin.Context) {
 		return
 	}
 
-	account, err := h.store.CreateAccount(c.Request.Context(), req.Username)
+	account, err := h.store.CreateAccount(c.Request.Context(), req.Username, false)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "username already exists"})
 		return
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"id":       account.ID,
-		"username": account.Username,
-		"api_key":  account.APIKey,
-		"message":  "registration successful — save your API key, it won't be shown again",
+		"id":                      account.ID,
+		"username":                account.Username,
+		"api_key":                 account.APIKey,
+		"permanent_mailbox_quota": account.PermanentMailboxQuota,
+		"message":                 "registration successful — save your API key, it won't be shown again",
 	})
 }

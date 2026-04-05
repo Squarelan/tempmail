@@ -113,7 +113,9 @@ services:
 
   # ==================== Go API 服务 ====================
   api:
-    image: 123nhh/tempmail-api:latest
+    build:
+      context: ./api
+      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -153,14 +155,20 @@ services:
 
   # ==================== Postfix 收件服务 ====================
   postfix:
-    image: 123nhh/tempmail-postfix:latest
+    build:
+      context: .
+      dockerfile: postfix/Dockerfile
     restart: unless-stopped
     ports:
       - "25:25"
     environment:
       DB_DSN: ${API_DB_DSN}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME}
+      API_URL: http://api:8080
     depends_on:
       pgbouncer:
+        condition: service_started
+      api:
         condition: service_started
     networks:
       - internal

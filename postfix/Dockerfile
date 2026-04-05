@@ -20,10 +20,11 @@ COPY postfix/master.cf /etc/postfix/master.cf
 COPY postfix/mail-receiver.py /usr/local/bin/mail-receiver
 COPY postfix/entrypoint.sh /entrypoint.sh
 
-RUN chmod +x /usr/local/bin/mail-receiver /entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/mail-receiver /entrypoint.sh /etc/postfix/main.cf /etc/postfix/master.cf \
+    && chmod +x /usr/local/bin/mail-receiver /entrypoint.sh
 
 # 创建虚拟域名目录
-RUN touch /etc/postfix/virtual_domains && postmap /etc/postfix/virtual_domains
+RUN touch /etc/postfix/virtual_domains
 
 EXPOSE 25
 

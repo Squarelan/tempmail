@@ -5,11 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TempMail — 临时邮箱平台</title>
   <meta name="description" content="高并发临时邮箱服务，支持多域名、API 接入、团队隔离" />
+  <meta name="color-scheme" content="light dark" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📬</text></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <script>
+    (() => {
+      try {
+        const mode = localStorage.getItem('tm_theme') || 'system';
+        const siteTitle = localStorage.getItem('tm_site_title') || 'TempMail';
+        const systemDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        const effective = mode === 'dark' ? 'dark' : mode === 'light' ? 'light' : (systemDark ? 'dark' : 'light');
+        document.title = `${siteTitle} — 临时邮箱平台`;
+        document.documentElement.dataset.theme = effective;
+        document.documentElement.style.colorScheme = effective;
+      } catch (_) {}
+    })();
+  </script>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/css/style.css?v=2" />
+  <link rel="stylesheet" href="/css/style.css?v=8" />
 </head>
 <body>
 
@@ -19,6 +33,6 @@
 <!-- ─── Toast 容器 ────────────────────────────────── -->
 <div id="toast-container" aria-live="polite"></div>
 
-<script src="/js/app.js?v=2"></script>
+<script src="/js/app.js?v=8"></script>
 </body>
 </html>

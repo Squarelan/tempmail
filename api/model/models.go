@@ -9,22 +9,24 @@ import (
 // ==================== 数据模型 ====================
 
 type Account struct {
-	ID        uuid.UUID `json:"id"`
-	Username  string    `json:"username"`
-	APIKey    string    `json:"api_key"`
-	IsAdmin   bool      `json:"is_admin"`
-	IsActive  bool      `json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID                    uuid.UUID `json:"id"`
+	Username              string    `json:"username"`
+	APIKey                string    `json:"api_key"`
+	IsAdmin               bool      `json:"is_admin"`
+	IsActive              bool      `json:"is_active"`
+	IsSystem              bool      `json:"is_system"`
+	PermanentMailboxQuota int       `json:"permanent_mailbox_quota"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 type Domain struct {
-	ID           int        `json:"id"`
-	Domain       string     `json:"domain"`
-	IsActive     bool       `json:"is_active"`
-	Status       string     `json:"status"` // active | pending | disabled
-	CreatedAt    time.Time  `json:"created_at"`
-	MxCheckedAt  *time.Time `json:"mx_checked_at,omitempty"`
+	ID          int        `json:"id"`
+	Domain      string     `json:"domain"`
+	IsActive    bool       `json:"is_active"`
+	Status      string     `json:"status"` // active | pending | disabled
+	CreatedAt   time.Time  `json:"created_at"`
+	MxCheckedAt *time.Time `json:"mx_checked_at,omitempty"`
 }
 
 type Stats struct {
@@ -37,13 +39,15 @@ type Stats struct {
 }
 
 type Mailbox struct {
-	ID          uuid.UUID `json:"id"`
-	AccountID   uuid.UUID `json:"account_id"`
-	Address     string    `json:"address"`
-	DomainID    int       `json:"domain_id"`
-	FullAddress string    `json:"full_address"`
-	CreatedAt   time.Time `json:"created_at"`
-	ExpiresAt   time.Time `json:"expires_at"`
+	ID          uuid.UUID  `json:"id"`
+	AccountID   uuid.UUID  `json:"account_id"`
+	Address     string     `json:"address"`
+	DomainID    int        `json:"domain_id"`
+	FullAddress string     `json:"full_address"`
+	IsCatchall  bool       `json:"is_catchall"`
+	IsPermanent bool       `json:"is_permanent"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 }
 
 type Email struct {
@@ -71,7 +75,7 @@ type CreateAccountResp struct {
 }
 
 type AddDomainReq struct {
-	Domain string `json:"domain" binding:"required,fqdn"`
+	Domain string `json:"domain" binding:"required"`
 }
 
 type DNSInstruction struct {
@@ -88,11 +92,18 @@ type AddDomainResp struct {
 }
 
 type CreateMailboxReq struct {
-	Address string `json:"address,omitempty"` // 可选，为空则随机生成
+	Address       string `json:"address,omitempty"`        // 可选，为空则随机生成
+	Domain        string `json:"domain,omitempty"`         // 可选：精确域名或 wildcard 规则
+	Permanent     bool   `json:"permanent,omitempty"`      // 是否创建永久邮箱
+	AutoSubdomain bool   `json:"auto_subdomain,omitempty"` // 当 domain=*.example.com 时自动分配真实子域
+	SubdomainMode string `json:"subdomain_mode,omitempty"` // auto_subdomain 下可选：random / wordlist
 }
 
 type CreateMailboxResp struct {
-	Mailbox Mailbox `json:"mailbox"`
+	Mailbox        Mailbox `json:"mailbox"`
+	AutoSubdomain  bool    `json:"auto_subdomain,omitempty"`
+	SubdomainMode  string  `json:"subdomain_mode,omitempty"`
+	GeneratedDomain string `json:"generated_domain,omitempty"`
 }
 
 type ListResp[T any] struct {
@@ -108,4 +119,20 @@ type EmailSummary struct {
 	Subject    string    `json:"subject"`
 	SizeBytes  int       `json:"size_bytes"`
 	ReceivedAt time.Time `json:"received_at"`
+}
+
+type CatchallMailboxSummary struct {
+	ID             uuid.UUID  `json:"id"`
+	AccountID      uuid.UUID  `json:"account_id"`
+	OwnerUsername  string     `json:"owner_username"`
+	OwnerIsAdmin   bool       `json:"owner_is_admin"`
+	OwnerIsSystem  bool       `json:"owner_is_system"`
+	Address        string     `json:"address"`
+	DomainID       int        `json:"domain_id"`
+	FullAddress    string     `json:"full_address"`
+	IsCatchall     bool       `json:"is_catchall"`
+	EmailCount     int        `json:"email_count"`
+	LastReceivedAt *time.Time `json:"last_received_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 }

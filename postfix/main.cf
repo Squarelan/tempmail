@@ -9,8 +9,8 @@ append_dot_mydomain = no
 smtpd_use_tls = no
 
 # 基本设置
-myhostname = mail.123nhh.xyz
-mydomain = 123nhh.xyz
+myhostname = mail.example.com
+mydomain = example.com
 myorigin = $mydomain
 inet_interfaces = all
 inet_protocols = ipv4
@@ -22,7 +22,7 @@ local_transport = error:local delivery disabled
 local_recipient_maps =
 
 # 虚拟域名 catch-all
-virtual_mailbox_domains = hash:/etc/postfix/virtual_domains
+virtual_mailbox_domains = regexp:/etc/postfix/virtual_domains
 virtual_transport = mailreceiver:
 
 # 限制
