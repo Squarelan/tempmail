@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"tempmail/middleware"
 	"tempmail/store"
@@ -51,14 +52,21 @@ func (h *AccountHandler) Create(c *gin.Context) {
 func (h *AccountHandler) List(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
+	query := strings.TrimSpace(c.DefaultQuery("q", ""))
+	role := strings.ToLower(strings.TrimSpace(c.DefaultQuery("role", "all")))
 	if page < 1 {
 		page = 1
 	}
 	if size < 1 || size > 100 {
 		size = 20
 	}
+	switch role {
+	case "", "all", "admin", "user", "system":
+	default:
+		role = "all"
+	}
 
-	accounts, total, err := h.store.ListAccounts(c.Request.Context(), page, size)
+	accounts, total, err := h.store.ListAccounts(c.Request.Context(), page, size, query, role)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -245,12 +253,18 @@ func (h *AccountHandler) SetPermanentQuota(c *gin.Context) {
 // GET /api/me - 查看当前账号信息
 func (h *AccountHandler) Me(c *gin.Context) {
 	account := middleware.GetAccount(c)
+	permanentCount, err := h.store.CountPermanentMailboxesByAccount(c.Request.Context(), account.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"id":                      account.ID,
 		"username":                account.Username,
 		"is_admin":                account.IsAdmin,
 		"is_system":               account.IsSystem,
 		"permanent_mailbox_quota": account.PermanentMailboxQuota,
+		"permanent_mailbox_count": permanentCount,
 		"created_at":              account.CreatedAt,
 	})
 }

@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"tempmail/middleware"
 	"tempmail/store"
@@ -36,10 +37,11 @@ func (h *EmailHandler) List(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
+	query := strings.TrimSpace(c.DefaultQuery("q", ""))
 	if page < 1 { page = 1 }
 	if size < 1 || size > 100 { size = 20 }
 
-	emails, total, err := h.store.ListEmails(c.Request.Context(), mailboxID, page, size)
+	emails, total, err := h.store.ListEmails(c.Request.Context(), mailboxID, page, size, query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

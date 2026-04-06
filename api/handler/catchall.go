@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"tempmail/model"
 	"tempmail/store"
@@ -24,14 +25,21 @@ func NewCatchallHandler(s *store.Store) *CatchallHandler {
 func (h *CatchallHandler) ListMailboxes(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("size", "50"))
+	query := strings.TrimSpace(c.DefaultQuery("q", ""))
+	owner := strings.ToLower(strings.TrimSpace(c.DefaultQuery("owner", "all")))
 	if page < 1 {
 		page = 1
 	}
 	if size < 1 || size > 200 {
 		size = 50
 	}
+	switch owner {
+	case "", "all", "admin", "user", "system":
+	default:
+		owner = "all"
+	}
 
-	mailboxes, total, err := h.store.ListCatchallMailboxes(c.Request.Context(), page, size)
+	mailboxes, total, err := h.store.ListCatchallMailboxes(c.Request.Context(), page, size, query, owner)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -74,6 +82,7 @@ func (h *CatchallHandler) ListEmails(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
+	query := strings.TrimSpace(c.DefaultQuery("q", ""))
 	if page < 1 {
 		page = 1
 	}
@@ -81,7 +90,7 @@ func (h *CatchallHandler) ListEmails(c *gin.Context) {
 		size = 20
 	}
 
-	emails, total, err := h.store.ListEmails(c.Request.Context(), mailbox.ID, page, size)
+	emails, total, err := h.store.ListEmails(c.Request.Context(), mailbox.ID, page, size, query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

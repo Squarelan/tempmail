@@ -91,17 +91,35 @@ func (s *Store) DeleteAccount(ctx context.Context, accountID uuid.UUID) error {
 	return err
 }
 
-func (s *Store) ListAccounts(ctx context.Context, page, size int) ([]model.Account, int, error) {
+func (s *Store) ListAccounts(ctx context.Context, page, size int, query, role string) ([]model.Account, int, error) {
 	var total int
-	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&total)
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM accounts
+		WHERE ($1 = '' OR username ILIKE '%' || $1 || '%' OR api_key ILIKE '%' || $1 || '%')
+		  AND (
+		    $2 = '' OR $2 = 'all' OR
+		    ($2 = 'admin' AND is_admin = TRUE AND is_system = FALSE) OR
+		    ($2 = 'user' AND is_admin = FALSE AND is_system = FALSE) OR
+		    ($2 = 'system' AND is_system = TRUE)
+		  )
+	`, query, role).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, username, api_key, is_admin, is_active, is_system, permanent_mailbox_quota, created_at, updated_at
-		 FROM accounts ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-		size, (page-1)*size,
+		 FROM accounts
+		 WHERE ($1 = '' OR username ILIKE '%' || $1 || '%' OR api_key ILIKE '%' || $1 || '%')
+		   AND (
+		     $2 = '' OR $2 = 'all' OR
+		     ($2 = 'admin' AND is_admin = TRUE AND is_system = FALSE) OR
+		     ($2 = 'user' AND is_admin = FALSE AND is_system = FALSE) OR
+		     ($2 = 'system' AND is_system = TRUE)
+		   )
+		 ORDER BY created_at DESC LIMIT $3 OFFSET $4`,
+		query, role, size, (page-1)*size,
 	)
 	if err != nil {
 		return nil, 0, err
@@ -458,19 +476,36 @@ func (s *Store) CreateMailbox(ctx context.Context, accountID uuid.UUID, address 
 	return &m, nil
 }
 
-func (s *Store) ListMailboxes(ctx context.Context, accountID uuid.UUID, page, size int) ([]model.Mailbox, int, error) {
+func (s *Store) ListMailboxes(ctx context.Context, accountID uuid.UUID, page, size int, query, kind string) ([]model.Mailbox, int, error) {
 	var total int
 	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM mailboxes WHERE account_id = $1`, accountID).Scan(&total)
+		`SELECT COUNT(*)
+		 FROM mailboxes
+		 WHERE account_id = $1
+		   AND ($2 = '' OR address ILIKE '%' || $2 || '%' OR full_address ILIKE '%' || $2 || '%')
+		   AND (
+		     $3 = '' OR $3 = 'all' OR
+		     ($3 = 'permanent' AND is_permanent = TRUE) OR
+		     ($3 = 'temporary' AND is_permanent = FALSE) OR
+		     ($3 = 'catchall' AND is_catchall = TRUE)
+		   )`, accountID, query, kind).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, account_id, address, domain_id, full_address, is_catchall, is_permanent, created_at, expires_at
-		 FROM mailboxes WHERE account_id = $1
-		 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-		accountID, size, (page-1)*size,
+		 FROM mailboxes
+		 WHERE account_id = $1
+		   AND ($2 = '' OR address ILIKE '%' || $2 || '%' OR full_address ILIKE '%' || $2 || '%')
+		   AND (
+		     $3 = '' OR $3 = 'all' OR
+		     ($3 = 'permanent' AND is_permanent = TRUE) OR
+		     ($3 = 'temporary' AND is_permanent = FALSE) OR
+		     ($3 = 'catchall' AND is_catchall = TRUE)
+		   )
+		 ORDER BY is_permanent DESC, created_at DESC LIMIT $4 OFFSET $5`,
+		accountID, query, kind, size, (page-1)*size,
 	)
 	if err != nil {
 		return nil, 0, err
@@ -556,10 +591,21 @@ func (s *Store) CountCatchallMailboxesByAccount(ctx context.Context, accountID u
 	return total, err
 }
 
-func (s *Store) ListCatchallMailboxes(ctx context.Context, page, size int) ([]model.CatchallMailboxSummary, int, error) {
+func (s *Store) ListCatchallMailboxes(ctx context.Context, page, size int, query, owner string) ([]model.CatchallMailboxSummary, int, error) {
 	var total int
 	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM mailboxes WHERE is_catchall = TRUE`,
+		`SELECT COUNT(*)
+		 FROM mailboxes mb
+		 JOIN accounts a ON a.id = mb.account_id
+		 WHERE mb.is_catchall = TRUE
+		   AND ($1 = '' OR mb.full_address ILIKE '%' || $1 || '%' OR a.username ILIKE '%' || $1 || '%')
+		   AND (
+		     $2 = '' OR $2 = 'all' OR
+		     ($2 = 'admin' AND a.is_admin = TRUE AND a.is_system = FALSE) OR
+		     ($2 = 'user' AND a.is_admin = FALSE AND a.is_system = FALSE) OR
+		     ($2 = 'system' AND a.is_system = TRUE)
+		   )`,
+		query, owner,
 	).Scan(&total)
 	if err != nil {
 		return nil, 0, err
@@ -584,10 +630,17 @@ func (s *Store) ListCatchallMailboxes(ctx context.Context, page, size int) ([]mo
 		JOIN accounts a ON a.id = mb.account_id
 		LEFT JOIN emails e ON e.mailbox_id = mb.id
 		WHERE mb.is_catchall = TRUE
+		  AND ($1 = '' OR mb.full_address ILIKE '%' || $1 || '%' OR a.username ILIKE '%' || $1 || '%')
+		  AND (
+		    $2 = '' OR $2 = 'all' OR
+		    ($2 = 'admin' AND a.is_admin = TRUE AND a.is_system = FALSE) OR
+		    ($2 = 'user' AND a.is_admin = FALSE AND a.is_system = FALSE) OR
+		    ($2 = 'system' AND a.is_system = TRUE)
+		  )
 		GROUP BY mb.id, a.username, a.is_admin, a.is_system
 		ORDER BY MAX(e.received_at) DESC NULLS LAST, mb.created_at DESC
-		LIMIT $1 OFFSET $2
-	`, size, (page-1)*size)
+		LIMIT $3 OFFSET $4
+	`, query, owner, size, (page-1)*size)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -819,19 +872,24 @@ func (s *Store) InsertEmail(ctx context.Context, mailboxID uuid.UUID, sender, su
 	return &e, nil
 }
 
-func (s *Store) ListEmails(ctx context.Context, mailboxID uuid.UUID, page, size int) ([]model.EmailSummary, int, error) {
+func (s *Store) ListEmails(ctx context.Context, mailboxID uuid.UUID, page, size int, query string) ([]model.EmailSummary, int, error) {
 	var total int
 	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM emails WHERE mailbox_id = $1`, mailboxID).Scan(&total)
+		`SELECT COUNT(*)
+		 FROM emails
+		 WHERE mailbox_id = $1
+		   AND ($2 = '' OR sender ILIKE '%' || $2 || '%' OR subject ILIKE '%' || $2 || '%' OR COALESCE(body_text, '') ILIKE '%' || $2 || '%')`, mailboxID, query).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, sender, subject, size_bytes, received_at
-		 FROM emails WHERE mailbox_id = $1
-		 ORDER BY received_at DESC LIMIT $2 OFFSET $3`,
-		mailboxID, size, (page-1)*size,
+		 FROM emails
+		 WHERE mailbox_id = $1
+		   AND ($2 = '' OR sender ILIKE '%' || $2 || '%' OR subject ILIKE '%' || $2 || '%' OR COALESCE(body_text, '') ILIKE '%' || $2 || '%')
+		 ORDER BY received_at DESC LIMIT $3 OFFSET $4`,
+		mailboxID, query, size, (page-1)*size,
 	)
 	if err != nil {
 		return nil, 0, err

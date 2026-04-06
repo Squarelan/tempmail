@@ -311,14 +311,21 @@ func (h *MailboxHandler) List(c *gin.Context) {
 	account := middleware.GetAccount(c)
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
+	query := strings.TrimSpace(c.DefaultQuery("q", ""))
+	kind := strings.ToLower(strings.TrimSpace(c.DefaultQuery("kind", "all")))
 	if page < 1 {
 		page = 1
 	}
 	if size < 1 || size > 100 {
 		size = 20
 	}
+	switch kind {
+	case "", "all", "permanent", "temporary", "catchall":
+	default:
+		kind = "all"
+	}
 
-	mailboxes, total, err := h.store.ListMailboxes(c.Request.Context(), account.ID, page, size)
+	mailboxes, total, err := h.store.ListMailboxes(c.Request.Context(), account.ID, page, size, query, kind)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

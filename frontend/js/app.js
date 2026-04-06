@@ -11,6 +11,18 @@ const DEFAULT_SITE_TITLE = 'TempMail';
 const SITE_TITLE_SUFFIX = '临时邮箱平台';
 const DEFAULT_SITE_LOGO = '✉';
 const DEFAULT_SITE_SUBTITLE = '临时邮箱服务 · 安全隔离 · 按需分配';
+const DEFAULT_PAGE_SIZE = 20;
+const DEFAULT_PAGE_SIZE_OPTIONS = [20, 50, 100];
+const DASHBOARD_MAILBOX_PAGE_SIZE = 20;
+const DASHBOARD_MAILBOX_PAGE_SIZE_OPTIONS = [20, 50, 100];
+const INBOX_EMAIL_PAGE_SIZE = 20;
+const INBOX_EMAIL_PAGE_SIZE_OPTIONS = [20, 50, 100];
+const ADMIN_ACCOUNT_PAGE_SIZE = 50;
+const ADMIN_ACCOUNT_PAGE_SIZE_OPTIONS = [20, 50, 100];
+const CATCHALL_MAILBOX_PAGE_SIZE = 50;
+const CATCHALL_MAILBOX_PAGE_SIZE_OPTIONS = [20, 50, 100, 200];
+const DOMAIN_PAGE_SIZE = 20;
+const DOMAIN_PAGE_SIZE_OPTIONS = [20, 50, 100];
 const DEFAULT_RESERVED_MAILBOX_ADDRESSES = `admin
 administrator
 root
@@ -41,6 +53,8 @@ const state = {
   siteSubtitle: localStorage.getItem('tm_site_subtitle') || DEFAULT_SITE_SUBTITLE,
   publicSettings: null,
   page:      'dashboard',
+  dashboardMailboxPage: 1,
+  dashboardMailboxPageSize: DASHBOARD_MAILBOX_PAGE_SIZE,
   // 当前邮箱
   currentMailbox: null,
   currentEmail:   null,
@@ -48,6 +62,7 @@ const state = {
   mailboxes: [],
   emails:    [],
   adminDomains: [],
+  listViews: {},
   bulkSelections: {},
   bulkVisibleIds: {},
   bulkActionConfigs: {},
@@ -147,6 +162,226 @@ function timeAgo(s) {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}小时前`;
   return `${Math.floor(hrs/24)}天前`;
+}
+
+function getListViewState(key, defaults = {}) {
+  const fallbackPage = Number(defaults.page) > 0 ? Number(defaults.page) : 1;
+  const fallbackSize = Number(defaults.size) > 0 ? Number(defaults.size) : DEFAULT_PAGE_SIZE;
+  const normalizedDefaults = {
+    ...defaults,
+    page: fallbackPage,
+    size: fallbackSize,
+  };
+  if (!state.listViews[key]) {
+    state.listViews[key] = { ...normalizedDefaults };
+  } else {
+    state.listViews[key] = { ...normalizedDefaults, ...state.listViews[key] };
+  }
+  const current = state.listViews[key];
+  const page = Number(current.page);
+  const size = Number(current.size);
+  current.page = Number.isFinite(page) && page > 0 ? page : fallbackPage;
+  current.size = Number.isFinite(size) && size > 0 ? size : fallbackSize;
+  current.__defaults = normalizedDefaults;
+  return current;
+}
+
+function updateListViewState(key, patch = {}, defaults = {}) {
+  const current = getListViewState(key, defaults);
+  state.listViews[key] = { ...current, ...patch };
+  return getListViewState(key, defaults);
+}
+
+function normalizePaginatedResponse(response, fallbackPage = 1, fallbackSize = 20) {
+  const data = Array.isArray(response) ? response : (response?.data || []);
+  const parsedPage = Number(Array.isArray(response) ? fallbackPage : response?.page);
+  const parsedSize = Number(Array.isArray(response) ? fallbackSize : response?.size);
+  const parsedTotal = Number(Array.isArray(response) ? data.length : response?.total);
+  const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : fallbackPage;
+  const size = Number.isFinite(parsedSize) && parsedSize > 0 ? parsedSize : fallbackSize;
+  const total = Number.isFinite(parsedTotal) && parsedTotal >= 0 ? parsedTotal : data.length;
+  const totalPages = Math.max(1, Math.ceil(total / size));
+  return { data, total, page, size, totalPages };
+}
+
+function paginateLocalItems(items = [], page = 1, size = DEFAULT_PAGE_SIZE) {
+  const data = Array.isArray(items) ? items : [];
+  const safeSize = Number.isFinite(Number(size)) && Number(size) > 0 ? Number(size) : DEFAULT_PAGE_SIZE;
+  const total = data.length;
+  const totalPages = Math.max(1, Math.ceil(total / safeSize));
+  const safePage = Math.min(Math.max(1, Number(page) || 1), totalPages);
+  const start = (safePage - 1) * safeSize;
+  return {
+    data: data.slice(start, start + safeSize),
+    total,
+    page: safePage,
+    size: safeSize,
+    totalPages,
+  };
+}
+
+function getLocalPageData(key, items = [], defaultSize = DEFAULT_PAGE_SIZE) {
+  const pagerState = getListViewState(key, { page: 1, size: defaultSize });
+  const pageData = paginateLocalItems(items, pagerState.page, pagerState.size);
+  updateListViewState(key, { page: pageData.page, size: pageData.size }, { page: 1, size: defaultSize });
+  return pageData;
+}
+
+function getPaginationPages(page, totalPages, windowSize = 5) {
+  if (totalPages <= 0) return [];
+  const pages = new Set([1, totalPages, page]);
+  const half = Math.floor(windowSize / 2);
+  const start = Math.max(1, page - half);
+  const end = Math.min(totalPages, page + half);
+  for (let current = start; current <= end; current += 1) {
+    pages.add(current);
+  }
+  const ordered = [...pages].sort((a, b) => a - b);
+  const result = [];
+  for (let i = 0; i < ordered.length; i += 1) {
+    const current = ordered[i];
+    const prev = ordered[i - 1];
+    if (i > 0 && current - prev > 1) {
+      result.push('ellipsis');
+    }
+    result.push(current);
+  }
+  return result;
+}
+
+function getListSearchInputId(key, field = 'q') {
+  return `list-search-${String(key).replace(/[^a-zA-Z0-9_-]/g, '_')}-${String(field).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+}
+
+function buildPaginationBar({
+  page,
+  size,
+  total,
+  totalPages,
+  itemLabel = '条',
+  pageSizeOptions = [],
+  onPageChange,
+  onPageSizeChange,
+  pagerKey = '',
+  compact = false,
+  hideIfSinglePage = false,
+}) {
+  if (total <= 0 || (hideIfSinglePage && totalPages <= 1)) return '';
+
+  const start = (page - 1) * size + 1;
+  const end = Math.min(total, page * size);
+  const pages = getPaginationPages(page, totalPages);
+  const keyArg = pagerKey ? `${JSON.stringify(String(pagerKey))}, ` : '';
+  const paginationButtons = totalPages > 1
+    ? `
+      <button class="btn btn-ghost btn-sm" ${page <= 1 ? 'disabled' : ''} onclick='${onPageChange}(${keyArg}${page - 1})'>上一页</button>
+      ${pages.map(item => item === 'ellipsis'
+        ? `<span style="padding:0 0.2rem;color:var(--text-muted)">…</span>`
+        : `<button class="btn ${item === page ? 'btn-primary' : 'btn-ghost'} btn-sm" style="min-width:2.4rem" onclick='${onPageChange}(${keyArg}${item})'>${item}</button>`).join('')}
+      <button class="btn btn-ghost btn-sm" ${page >= totalPages ? 'disabled' : ''} onclick='${onPageChange}(${keyArg}${page + 1})'>下一页</button>
+    `
+    : '';
+  const pageSizeSelect = pageSizeOptions.length > 0
+    ? `
+      <label style="display:flex;align-items:center;gap:0.45rem;font-size:0.8rem;color:var(--text-secondary)">
+        <span>每页</span>
+        <select class="form-input" style="width:auto;min-width:84px" onchange='${onPageSizeChange}(${keyArg}this.value)'>
+          ${pageSizeOptions.map(option => `
+            <option value="${option}" ${Number(option) === Number(size) ? 'selected' : ''}>${option}</option>
+          `).join('')}
+        </select>
+      </label>
+    `
+    : '';
+  const wrapperStyle = compact
+    ? 'padding:0.8rem 1rem;border-top:1px solid var(--border)'
+    : 'margin-top:0.8rem;padding:0.8rem 1rem';
+  const wrapperClass = compact ? '' : ' class="card"';
+
+  return `
+    <div${wrapperClass} style="${wrapperStyle}">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:0.8rem;flex-wrap:wrap">
+        <div style="font-size:0.82rem;color:var(--text-secondary)">
+          当前显示 <strong>${start}</strong> - <strong>${end}</strong> / 共 <strong>${total}</strong> 个${escHtml(itemLabel)}
+        </div>
+        <div style="display:flex;align-items:center;gap:0.45rem;flex-wrap:wrap">
+          ${pageSizeSelect}
+          ${paginationButtons}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function buildListFilterBar({
+  key,
+  searchField = 'q',
+  searchValue = '',
+  searchPlaceholder = '搜索…',
+  searchButtonLabel = '搜索',
+  filters = [],
+  hint = '',
+  resetLabel = '清空筛选',
+}) {
+  const searchInputId = getListSearchInputId(key, searchField);
+  return `
+    <div class="card" style="margin-bottom:0.8rem;padding:0.85rem 1rem">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:0.8rem;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;flex:1 1 420px">
+          <input
+            class="form-input"
+            id="${searchInputId}"
+            value="${escHtml(searchValue || '')}"
+            placeholder="${escHtml(searchPlaceholder)}"
+            style="min-width:220px;flex:1 1 260px"
+            onkeydown='handleListSearchKeydown(event, ${JSON.stringify(String(key))}, ${JSON.stringify(String(searchField))})'
+          />
+          <button class="btn btn-primary btn-sm" onclick='applyListSearch(${JSON.stringify(String(key))}, ${JSON.stringify(String(searchField))})'>${escHtml(searchButtonLabel)}</button>
+          ${filters.map(filter => `
+            <label style="display:flex;align-items:center;gap:0.45rem;font-size:0.8rem;color:var(--text-secondary)">
+              <span>${escHtml(filter.label || '筛选')}</span>
+              <select class="form-input" style="width:auto;min-width:110px" onchange='setListViewField(${JSON.stringify(String(key))}, ${JSON.stringify(String(filter.field || 'type'))}, this.value)'>
+                ${(filter.options || []).map(option => `
+                  <option value="${escHtml(option.value)}" ${String(option.value) === String(filter.value) ? 'selected' : ''}>${escHtml(option.label)}</option>
+                `).join('')}
+              </select>
+            </label>
+          `).join('')}
+        </div>
+        <div style="display:flex;align-items:center;gap:0.45rem;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" onclick='resetListViewFilters(${JSON.stringify(String(key))})'>${escHtml(resetLabel)}</button>
+        </div>
+      </div>
+      ${hint ? `<div class="form-hint" style="margin-top:0.55rem">${escHtml(hint)}</div>` : ''}
+    </div>
+  `;
+}
+
+function buildQueryString(params = {}) {
+  const query = new URLSearchParams();
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null) return;
+    const normalized = String(value).trim();
+    if (!normalized) return;
+    query.set(key, normalized);
+  });
+  const result = query.toString();
+  return result ? `?${result}` : '';
+}
+
+function withQuery(base, params = {}) {
+  return `${base}${buildQueryString(params)}`;
+}
+
+function resetRelatedListPages(key) {
+  const mappings = {
+    'domains-guide-controls': ['domains-guide-pending', 'domains-guide-exact', 'domains-guide-wildcard'],
+    'admin-domains-controls': ['admin-domains-pending', 'admin-domains-exact', 'admin-domains-wildcard'],
+  };
+  for (const relatedKey of (mappings[key] || [])) {
+    if (!state.listViews[relatedKey]) continue;
+    state.listViews[relatedKey].page = 1;
+  }
 }
 
 async function copyText(text) {
@@ -382,7 +617,11 @@ async function runBulkDelete({ selectionKey, itemLabel, onDelete, onDone }) {
   });
 }
 
-function getPermanentMailboxUsage(mailboxes = state.mailboxes) {
+function getPermanentMailboxUsage(mailboxes = state.mailboxes, account = state.account) {
+  const knownCount = Number(account?.permanent_mailbox_count);
+  if (Number.isFinite(knownCount) && knownCount >= 0) {
+    return knownCount;
+  }
   return (mailboxes || []).filter(mb => mb.is_permanent).length;
 }
 
@@ -395,7 +634,7 @@ function getPermanentMailboxQuota(account = state.account) {
 function getPermanentMailboxRemaining(mailboxes = state.mailboxes, account = state.account) {
   const quota = getPermanentMailboxQuota(account);
   if (!Number.isFinite(quota)) return Infinity;
-  return Math.max(quota - getPermanentMailboxUsage(mailboxes), 0);
+  return Math.max(quota - getPermanentMailboxUsage(mailboxes, account), 0);
 }
 
 function applySiteBranding(siteTitle = getSiteTitle(), siteLogo = getSiteLogo(), siteSubtitle = getSiteSubtitle()) {
@@ -492,22 +731,41 @@ const api = {
   getDomainStatus: id => apiFetch(API_BASE + '/domains/' + id + '/status'),
   // 邮箱 → 解包 {data:[...]}
   createMailbox:   (body) => apiFetch(API_BASE + '/mailboxes', { method: 'POST', body: JSON.stringify(body || {}) }),
-  listMailboxes:   () => apiFetch(API_BASE + '/mailboxes').then(d => Array.isArray(d) ? d : (d.data || [])),
+  listMailboxesPage: (page = 1, size = DASHBOARD_MAILBOX_PAGE_SIZE, q = '', kind = 'all') =>
+    apiFetch(withQuery(API_BASE + '/mailboxes', { page, size, q, kind })).then(d => normalizePaginatedResponse(d, page, size)),
+  listMailboxes:   (page = 1, size = DASHBOARD_MAILBOX_PAGE_SIZE, q = '', kind = 'all') => api.listMailboxesPage(page, size, q, kind).then(d => d.data || []),
   deleteMailbox: id  => apiFetch(API_BASE + '/mailboxes/' + id, { method: 'DELETE' }),
   // 邮件 → 解包 {data:[...]}
-  listEmails: mid    => apiFetch(API_BASE + '/mailboxes/' + mid + '/emails').then(d => Array.isArray(d) ? d : (d.data || [])),
+  listEmailsPage: (mid, page = 1, size = INBOX_EMAIL_PAGE_SIZE, q = '') =>
+    apiFetch(withQuery(API_BASE + '/mailboxes/' + mid + '/emails', { page, size, q })).then(d => normalizePaginatedResponse(d, page, size)),
+  listEmails: (mid, page = 1, size = INBOX_EMAIL_PAGE_SIZE, q = '') => api.listEmailsPage(mid, page, size, q).then(d => d.data || []),
   getEmail:   (mid, eid) => apiFetch(API_BASE + '/mailboxes/' + mid + '/emails/' + eid).then(d => d.email || d),
   deleteEmail:(mid, eid) => apiFetch(API_BASE + '/mailboxes/' + mid + '/emails/' + eid, { method: 'DELETE' }),
   // 管理
   admin: {
-    listAccounts:  (page=1,size=50) => apiFetch(API_BASE + '/admin/accounts?page='+page+'&size='+size).then(d => Array.isArray(d) ? d : (d.data || [])),
+    listAccountsPage:  (page = 1, size = ADMIN_ACCOUNT_PAGE_SIZE, q = '', role = 'all') =>
+      apiFetch(withQuery(API_BASE + '/admin/accounts', { page, size, q, role })).then(d => normalizePaginatedResponse(d, page, size)),
+    listAccounts:  (page = 1, size = ADMIN_ACCOUNT_PAGE_SIZE, q = '', role = 'all') => api.admin.listAccountsPage(page, size, q, role).then(d => d.data || []),
+    listAllAccounts: async (size = ADMIN_ACCOUNT_PAGE_SIZE_OPTIONS[ADMIN_ACCOUNT_PAGE_SIZE_OPTIONS.length - 1]) => {
+      const firstPage = await api.admin.listAccountsPage(1, size);
+      const all = [...(firstPage.data || [])];
+      for (let page = 2; page <= firstPage.totalPages; page += 1) {
+        const nextPage = await api.admin.listAccountsPage(page, size);
+        all.push(...(nextPage.data || []));
+      }
+      return all;
+    },
     createAccount: body => apiFetch(API_BASE + '/admin/accounts', { method: 'POST', body: JSON.stringify(body) }),
     deleteAccount: id   => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'DELETE' }),
     toggleAccountAdmin: (id, is_admin) => apiFetch(API_BASE + '/admin/accounts/' + id + '/admin', { method: 'PUT', body: JSON.stringify({ is_admin }) }),
     setAccountQuota: (id, permanent_mailbox_quota) => apiFetch(API_BASE + '/admin/accounts/' + id + '/quota', { method: 'PUT', body: JSON.stringify({ permanent_mailbox_quota }) }),
-    listCatchallMailboxes: (page=1,size=100) => apiFetch(API_BASE + '/admin/catchall/mailboxes?page='+page+'&size='+size).then(d => Array.isArray(d) ? d : (d.data || [])),
+    listCatchallMailboxesPage: (page = 1, size = CATCHALL_MAILBOX_PAGE_SIZE, q = '', owner = 'all') =>
+      apiFetch(withQuery(API_BASE + '/admin/catchall/mailboxes', { page, size, q, owner })).then(d => normalizePaginatedResponse(d, page, size)),
+    listCatchallMailboxes: (page = 1, size = CATCHALL_MAILBOX_PAGE_SIZE, q = '', owner = 'all') => api.admin.listCatchallMailboxesPage(page, size, q, owner).then(d => d.data || []),
     deleteCatchallMailbox: id => apiFetch(API_BASE + '/admin/catchall/mailboxes/' + id, { method: 'DELETE' }),
-    listCatchallEmails: mid => apiFetch(API_BASE + '/admin/catchall/mailboxes/' + mid + '/emails').then(d => Array.isArray(d) ? d : (d.data || [])),
+    listCatchallEmailsPage: (mid, page = 1, size = INBOX_EMAIL_PAGE_SIZE, q = '') =>
+      apiFetch(withQuery(API_BASE + '/admin/catchall/mailboxes/' + mid + '/emails', { page, size, q })).then(d => normalizePaginatedResponse(d, page, size)),
+    listCatchallEmails: (mid, page = 1, size = INBOX_EMAIL_PAGE_SIZE, q = '') => api.admin.listCatchallEmailsPage(mid, page, size, q).then(d => d.data || []),
     getCatchallEmail: (mid, eid) => apiFetch(API_BASE + '/admin/catchall/mailboxes/' + mid + '/emails/' + eid).then(d => d.email || d),
     deleteCatchallEmail: (mid, eid) => apiFetch(API_BASE + '/admin/catchall/mailboxes/' + mid + '/emails/' + eid, { method: 'DELETE' }),
     addDomain:   body => apiFetch(API_BASE + '/admin/domains', { method: 'POST', body: JSON.stringify(body) }),
@@ -943,16 +1201,118 @@ window.retryCurrentPage = function() {
   renderPage(state.page);
 };
 
+window.applyListSearch = function(key, field = 'q') {
+  const input = document.getElementById(getListSearchInputId(key, field));
+  const value = (input?.value || '').trim();
+  updateListViewState(key, { [field]: value, page: 1 });
+  resetRelatedListPages(key);
+  renderPage(state.page);
+};
+
+window.handleListSearchKeydown = function(event, key, field = 'q') {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  window.applyListSearch(key, field);
+};
+
+window.setListViewField = function(key, field, value) {
+  updateListViewState(key, { [field]: value, page: 1 });
+  resetRelatedListPages(key);
+  renderPage(state.page);
+};
+
+window.resetListViewFilters = function(key) {
+  const current = getListViewState(key);
+  const defaults = {
+    ...(current?.__defaults || {}),
+    page: 1,
+    size: current?.size || current?.__defaults?.size || DEFAULT_PAGE_SIZE,
+  };
+  state.listViews[key] = { ...defaults, __defaults: defaults };
+  resetRelatedListPages(key);
+  renderPage(state.page);
+};
+
+window.setListPage = function(key, page) {
+  const current = getListViewState(key);
+  const nextPage = Math.max(1, Number(page) || 1);
+  if (nextPage === current.page) return;
+  current.page = nextPage;
+  renderPage(state.page);
+};
+
+window.setListPageSize = function(key, size) {
+  const nextSize = Number(size);
+  if (!Number.isFinite(nextSize) || nextSize < 1) {
+    toast('无效的每页数量', 'warn');
+    return;
+  }
+  const current = getListViewState(key, { page: 1, size: nextSize });
+  if (current.size === nextSize) return;
+  current.size = nextSize;
+  current.page = 1;
+  renderPage(state.page);
+};
+
+window.setDashboardMailboxPage = function(page) {
+  window.setListPage('dashboard-mailboxes', page);
+};
+
+window.setDashboardMailboxPageSize = function(size) {
+  window.setListPageSize('dashboard-mailboxes', size);
+};
+
 // ─── Dashboard ─────────────────────────────────────────────
 async function renderDashboard(container) {
   const bulkKey = 'dashboard-mailboxes';
+  const listKey = 'dashboard-mailboxes';
   const isAdmin = state.account?.is_admin;
-  const [mailboxes, domains, statsData] = await Promise.all([
-    api.listMailboxes(),
+  const listState = getListViewState(listKey, {
+    page: 1,
+    size: DASHBOARD_MAILBOX_PAGE_SIZE,
+    q: '',
+    kind: 'all',
+  });
+  const currentPage = Math.max(1, Number(listState.page) || 1);
+  const pageSize = DASHBOARD_MAILBOX_PAGE_SIZE_OPTIONS.includes(Number(listState.size))
+    ? Number(listState.size)
+    : DASHBOARD_MAILBOX_PAGE_SIZE;
+  const query = String(listState.q || '').trim();
+  const kind = ['all', 'permanent', 'temporary', 'catchall'].includes(String(listState.kind || 'all'))
+    ? String(listState.kind || 'all')
+    : 'all';
+  const [mailboxPage, domains, statsData, accountData] = await Promise.all([
+    api.listMailboxesPage(currentPage, pageSize, query, kind),
     api.domains(),
     api.stats().catch(() => null),
+    api.me().catch(() => state.account),
   ]);
-  state.mailboxes = mailboxes || [];
+  if (currentPage > mailboxPage.totalPages) {
+    updateListViewState(listKey, { page: mailboxPage.totalPages }, {
+      page: 1,
+      size: DASHBOARD_MAILBOX_PAGE_SIZE,
+      q: '',
+      kind: 'all',
+    });
+    return renderDashboard(container);
+  }
+  if (accountData) {
+    state.account = accountData;
+    localStorage.setItem('tm_account', JSON.stringify(accountData));
+  }
+  const currentAccount = state.account || accountData || null;
+  updateListViewState(listKey, {
+    page: mailboxPage.page,
+    size: mailboxPage.size,
+    q: query,
+    kind,
+  }, {
+    page: 1,
+    size: DASHBOARD_MAILBOX_PAGE_SIZE,
+    q: '',
+    kind: 'all',
+  });
+  state.mailboxes = mailboxPage.data || [];
   setBulkVisibleIds(bulkKey, state.mailboxes.map(mb => mb.id));
 
   const actions = $('topbar-actions');
@@ -964,15 +1324,16 @@ async function renderDashboard(container) {
   }
 
   const boxes  = state.mailboxes;
+  const totalMailboxes = Number(mailboxPage.total || 0);
   const st     = statsData || {};
   const activeDomains  = (domains||[]).filter(d => d.is_active).length;
   const pendingDomains = (domains||[]).filter(d => d.status === 'pending').length;
-  const permanentUsed = getPermanentMailboxUsage(boxes);
-  const permanentQuota = getPermanentMailboxQuota(state.account);
-  const permanentRemaining = getPermanentMailboxRemaining(boxes, state.account);
+  const permanentUsed = getPermanentMailboxUsage(boxes, currentAccount);
+  const permanentQuota = getPermanentMailboxQuota(currentAccount);
+  const permanentRemaining = getPermanentMailboxRemaining(boxes, currentAccount);
 
   const statCards = [
-    { label: '我的邮箱', value: boxes.length,                   note: '当前有效' },
+    { label: '我的邮箱', value: totalMailboxes,                 note: mailboxPage.totalPages > 1 ? `第 ${mailboxPage.page} / ${mailboxPage.totalPages} 页` : '当前有效' },
     { label: '永久邮箱', value: permanentUsed,                  note: Number.isFinite(permanentQuota) ? `剩余 ${permanentRemaining} / 总额 ${permanentQuota}` : '管理员无限制' },
     { label: '可用域名', value: activeDomains,                  note: `共 ${(domains||[]).length} 个` },
     { label: '收到邮件', value: st.total_emails ?? '—',         note: '全平台累计' },
@@ -1003,11 +1364,31 @@ async function renderDashboard(container) {
         <div style="font-size:0.82rem">🔄 有 ${pendingDomains} 个域名正在 MX 验证中，通过后将自动加入域名池</div>
       </div>
     ` : ''}
+    ${buildListFilterBar({
+      key: listKey,
+      searchValue: query,
+      searchPlaceholder: '搜索邮箱地址，例如 hello@example.com',
+      searchButtonLabel: '搜索邮箱',
+      filters: [
+        {
+          field: 'kind',
+          label: '类型',
+          value: kind,
+          options: [
+            { value: 'all', label: '全部邮箱' },
+            { value: 'permanent', label: '仅永久' },
+            { value: 'temporary', label: '仅临时' },
+            { value: 'catchall', label: '仅 Catch-all' },
+          ],
+        },
+      ],
+      hint: '永久邮箱已按置顶模式排序，搜索和筛选会作用于整个邮箱列表。',
+    })}
     ${boxes.length === 0 ? `
       <div class="card" style="margin-top:0.8rem">
         <div class="empty-state">
           <span class="empty-icon">✉</span>
-          <p>还没有邮箱，点击右上角"新建邮箱"创建第一个</p>
+          <p>${query || kind !== 'all' ? '没有匹配当前筛选条件的邮箱' : '还没有邮箱，点击右上角"新建邮箱"创建第一个'}</p>
         </div>
       </div>
     ` : `
@@ -1017,10 +1398,22 @@ async function renderDashboard(container) {
         actions: [
           { value: 'delete', label: '删除选中邮箱', run: () => window.bulkDeleteMailboxes(bulkKey) },
         ],
+        scopeHint: '当前批量操作仅对本页邮箱生效，翻页后会自动切换到新页面的可见列表。',
       })}
       <div class="mailbox-grid" id="mailbox-grid" style="margin-top:0.8rem">
         ${boxes.map(mb => buildMailboxCard(mb, bulkKey)).join('')}
       </div>
+      ${buildPaginationBar({
+        page: mailboxPage.page,
+        size: mailboxPage.size,
+        total: totalMailboxes,
+        totalPages: mailboxPage.totalPages,
+        itemLabel: '邮箱',
+        pageSizeOptions: DASHBOARD_MAILBOX_PAGE_SIZE_OPTIONS,
+        onPageChange: 'setListPage',
+        onPageSizeChange: 'setListPageSize',
+        pagerKey: listKey,
+      })}
     `}
   `;
 }
@@ -1087,11 +1480,21 @@ function getMailboxBackPage(mb = state.currentMailbox) {
   return isAdminCatchallScope(mb) ? 'admin-catchall' : 'dashboard';
 }
 
-async function listEmailsForMailbox(mb = state.currentMailbox) {
-  if (!mb) return [];
+function getInboxListViewKey(mb = state.currentMailbox) {
+  if (!mb?.id) return 'inbox-list-unknown';
+  return `inbox-list-${mb.scope || 'regular'}-${mb.id}`;
+}
+
+async function listEmailsPageForMailbox(mb = state.currentMailbox, page = 1, size = INBOX_EMAIL_PAGE_SIZE, q = '') {
+  if (!mb) return normalizePaginatedResponse([], page, size);
   return isAdminCatchallScope(mb)
-    ? api.admin.listCatchallEmails(mb.id)
-    : api.listEmails(mb.id);
+    ? api.admin.listCatchallEmailsPage(mb.id, page, size, q)
+    : api.listEmailsPage(mb.id, page, size, q);
+}
+
+async function listEmailsForMailbox(mb = state.currentMailbox, page = 1, size = INBOX_EMAIL_PAGE_SIZE, q = '') {
+  const result = await listEmailsPageForMailbox(mb, page, size, q);
+  return result?.data || [];
 }
 
 async function getEmailForMailbox(eid, mb = state.currentMailbox) {
@@ -1109,6 +1512,7 @@ async function deleteEmailForMailbox(eid, mb = state.currentMailbox) {
 }
 
 window.openInbox = function(id, addr, scope = 'regular') {
+  updateListViewState(`inbox-list-${scope || 'regular'}-${id}`, { page: 1, q: '' }, { page: 1, size: INBOX_EMAIL_PAGE_SIZE, q: '' });
   state.currentMailbox = { id, full_address: addr, scope };
   navigate('inbox');
 };
@@ -1428,7 +1832,10 @@ async function renderInbox(container) {
   const mb = state.currentMailbox;
   if (!mb) { navigate('dashboard'); return; }
   const bulkKey = getInboxBulkKey(mb);
+  const listKey = getInboxListViewKey(mb);
   const backPage = getMailboxBackPage(mb);
+  const pagerState = getListViewState(listKey, { page: 1, size: INBOX_EMAIL_PAGE_SIZE, q: '' });
+  const query = String(pagerState.q || '').trim();
 
   const title = $('topbar-title'); if (title) title.textContent = mb.full_address;
   const sub   = $('topbar-subtitle'); if (sub) sub.textContent = isAdminCatchallScope(mb) ? 'Catch-all 邮件列表' : '邮件列表';
@@ -1441,8 +1848,14 @@ async function renderInbox(container) {
     `;
   }
 
-  const emails = await listEmailsForMailbox(mb);
-  state.emails = emails || [];
+  const emailPage = await listEmailsPageForMailbox(mb, pagerState.page, pagerState.size, query);
+  if (pagerState.page > emailPage.totalPages) {
+    updateListViewState(listKey, { page: emailPage.totalPages }, { page: 1, size: INBOX_EMAIL_PAGE_SIZE, q: '' });
+    return renderInbox(container);
+  }
+  updateListViewState(listKey, { page: emailPage.page, size: emailPage.size, q: query }, { page: 1, size: INBOX_EMAIL_PAGE_SIZE, q: '' });
+  state.emails = emailPage.data || [];
+  state.currentEmailPage = emailPage;
   setBulkVisibleIds(bulkKey, state.emails.map(e => e.id));
 
   // 启动自动刷新（每 8 秒）
@@ -1451,12 +1864,17 @@ async function renderInbox(container) {
     if (state.page !== 'inbox') { clearInboxPoller(); return; }
     if (document.hidden) return;
     try {
-      const fresh = await listEmailsForMailbox(mb);
-      if (!fresh) return;
+      const currentPager = getListViewState(listKey, { page: 1, size: INBOX_EMAIL_PAGE_SIZE, q: '' });
+      const freshPage = await listEmailsPageForMailbox(mb, currentPager.page, currentPager.size, String(currentPager.q || '').trim());
+      if (!freshPage) return;
+      const fresh = freshPage.data || [];
       // 有新邮件才重新渲染，避免闪烁
-      if (fresh.length !== (state.emails || []).length ||
-          (fresh[0]?.id !== state.emails?.[0]?.id)) {
+      if (freshPage.total !== state.currentEmailPage?.total ||
+          fresh.length !== (state.emails || []).length ||
+          fresh[0]?.id !== state.emails?.[0]?.id ||
+          fresh[fresh.length - 1]?.id !== state.emails?.[state.emails.length - 1]?.id) {
         state.emails = fresh;
+        state.currentEmailPage = freshPage;
         const c = $('page-content');
         if (c) renderInbox(c);
       }
@@ -1465,11 +1883,18 @@ async function renderInbox(container) {
 
   if (!state.emails.length) {
     container.innerHTML = `
+      ${buildListFilterBar({
+        key: listKey,
+        searchValue: query,
+        searchPlaceholder: '搜索发件人、主题或正文片段',
+        searchButtonLabel: '搜索邮件',
+        hint: '可按发件人、主题或正文内容搜索当前邮箱中的邮件。',
+      })}
       <div class="card">
         <div class="empty-state">
           <span class="empty-icon">📭</span>
-          <p>暂无邮件</p>
-          <p style="margin-top:0.5rem;font-size:0.8rem">向 <strong>${escHtml(mb.full_address)}</strong> 发送邮件后，邮件将显示在此处</p>
+          <p>${query ? '没有匹配当前搜索条件的邮件' : '暂无邮件'}</p>
+          <p style="margin-top:0.5rem;font-size:0.8rem">${query ? `请尝试更换关键词，或清空筛选后重新查看 <strong>${escHtml(mb.full_address)}</strong>。` : `向 <strong>${escHtml(mb.full_address)}</strong> 发送邮件后，邮件将显示在此处`}</p>
         </div>
       </div>
     `;
@@ -1477,15 +1902,36 @@ async function renderInbox(container) {
   }
 
   container.innerHTML = `
+    ${buildListFilterBar({
+      key: listKey,
+      searchValue: query,
+      searchPlaceholder: '搜索发件人、主题或正文片段',
+      searchButtonLabel: '搜索邮件',
+      hint: '可按发件人、主题或正文内容搜索当前邮箱中的邮件。',
+    })}
     ${buildBulkToolbar({
       key: bulkKey,
       itemLabel: '邮件',
       actions: [
         { value: 'delete', label: '删除选中邮件', run: () => window.bulkDeleteEmails(bulkKey) },
       ],
+      scopeHint: '当前批量操作仅对本页邮件生效，翻页后会自动切换到新页面的可见列表。',
     })}
     <div class="card" style="padding:0">
       ${state.emails.map(e => buildEmailItem(mb.id, e, bulkKey)).join('')}
+      ${buildPaginationBar({
+        page: emailPage.page,
+        size: emailPage.size,
+        total: emailPage.total,
+        totalPages: emailPage.totalPages,
+        itemLabel: '邮件',
+        pageSizeOptions: INBOX_EMAIL_PAGE_SIZE_OPTIONS,
+        onPageChange: 'setListPage',
+        onPageSizeChange: 'setListPageSize',
+        pagerKey: listKey,
+        compact: true,
+        hideIfSinglePage: true,
+      })}
     </div>
   `;
 }
@@ -1605,6 +2051,7 @@ async function renderEmailView(container) {
 
 // ─── 域名列表 & 指南 ─────────────────────────────────────────
 async function renderDomainsGuide(container) {
+  const controlsKey = 'domains-guide-controls';
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `<button class="btn btn-success btn-sm" onclick="showMXRegisterModal()">⚡ 提交域名自动验证</button>`;
@@ -1620,11 +2067,19 @@ async function renderDomainsGuide(container) {
   const ipLabel = smtpIP || '&lt;服务器 IP&gt;';
   const mxTarget = smtpHostname || '&lt;服务器邮件主机名&gt;';
   const needsARec = !smtpHostname;
+  const controlState = getListViewState(controlsKey, { page: 1, size: DOMAIN_PAGE_SIZE, q: '' });
+  const query = String(controlState.q || '').trim();
+  const normalizedQuery = query.toLowerCase();
+  const matchDomain = (domain) => !normalizedQuery || String(domain?.domain || '').toLowerCase().includes(normalizedQuery);
 
-  const pending = (domains||[]).filter(d => d.status === 'pending');
-  const active  = (domains||[]).filter(d => d.status !== 'pending');
+  const filteredDomains = (domains || []).filter(matchDomain);
+  const pending = filteredDomains.filter(d => d.status === 'pending');
+  const active  = filteredDomains.filter(d => d.status !== 'pending');
   const activeGroups = splitManagedDomains(active);
   const pendingGroups = splitManagedDomains(pending);
+  const pendingPage = getLocalPageData('domains-guide-pending', pending, DOMAIN_PAGE_SIZE);
+  const exactPage = getLocalPageData('domains-guide-exact', activeGroups.exact, DOMAIN_PAGE_SIZE);
+  const wildcardPage = getLocalPageData('domains-guide-wildcard', activeGroups.wildcard, DOMAIN_PAGE_SIZE);
 
   const summaryCardsHtml = `
     <div class="stat-grid domain-overview-grid">
@@ -1650,13 +2105,13 @@ async function renderDomainsGuide(container) {
     <div class="card" style="border-left:3px solid var(--clr-warn,#e6a817)">
       <div class="card-header">
         <div class="card-title">🔄 待 MX 验证 (${pending.length})</div>
-        <div style="font-size:0.78rem;color:var(--text-muted)">后台每 30 秒自动检测，验证通过后自动激活</div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">后台每 30 秒自动检测，验证通过后自动激活${pendingPage.totalPages > 1 ? ` · 第 ${pendingPage.page}/${pendingPage.totalPages} 页` : ''}</div>
       </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>域名</th><th>类型</th><th>上次检测</th><th>状态</th></tr></thead>
           <tbody>
-            ${pending.map(d => `
+            ${pendingPage.data.map(d => `
               <tr id="pending-row-${d.id}">
                 <td style="font-family:var(--font-mono);font-size:0.82rem">${escHtml(d.domain)}</td>
                 <td>${renderDomainTypeHtml(d.domain)}</td>
@@ -1667,6 +2122,19 @@ async function renderDomainsGuide(container) {
           </tbody>
         </table>
       </div>
+      ${buildPaginationBar({
+        page: pendingPage.page,
+        size: pendingPage.size,
+        total: pendingPage.total,
+        totalPages: pendingPage.totalPages,
+        itemLabel: '待验证域名',
+        pageSizeOptions: DOMAIN_PAGE_SIZE_OPTIONS,
+        onPageChange: 'setListPage',
+        onPageSizeChange: 'setListPageSize',
+        pagerKey: 'domains-guide-pending',
+        compact: true,
+        hideIfSinglePage: true,
+      })}
     </div>
   ` : '';
 
@@ -1674,7 +2142,7 @@ async function renderDomainsGuide(container) {
     <div class="card">
       <div class="card-header">
         <div class="card-title">◎ 精确域名</div>
-        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.exact.length} 个</div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.exact.length} 个${exactPage.totalPages > 1 ? ` · 第 ${exactPage.page}/${exactPage.totalPages} 页` : ''}</div>
       </div>
       <div class="table-wrap">
         <table>
@@ -1682,7 +2150,7 @@ async function renderDomainsGuide(container) {
           <tbody>
             ${activeGroups.exact.length === 0
               ? `<tr><td colspan="3" style="text-align:center;color:var(--text-muted)">暂无精确域名</td></tr>`
-              : activeGroups.exact.map(d => `
+              : exactPage.data.map(d => `
                 <tr>
                   <td style="font-family:var(--font-mono);font-size:0.82rem" title="${escHtml(d.domain)}">${escHtml(d.domain)}</td>
                   <td>
@@ -1699,6 +2167,19 @@ async function renderDomainsGuide(container) {
           </tbody>
         </table>
       </div>
+      ${buildPaginationBar({
+        page: exactPage.page,
+        size: exactPage.size,
+        total: exactPage.total,
+        totalPages: exactPage.totalPages,
+        itemLabel: '精确域名',
+        pageSizeOptions: DOMAIN_PAGE_SIZE_OPTIONS,
+        onPageChange: 'setListPage',
+        onPageSizeChange: 'setListPageSize',
+        pagerKey: 'domains-guide-exact',
+        compact: true,
+        hideIfSinglePage: true,
+      })}
     </div>
   `;
 
@@ -1709,7 +2190,7 @@ async function renderDomainsGuide(container) {
           <div class="card-title">✳ 通配子域规则</div>
           <div class="domain-section-hint">匹配任意子域，例如 <code>team.example.com</code>，但不会匹配根域 <code>example.com</code></div>
         </div>
-        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.wildcard.length} 个</div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.wildcard.length} 个${wildcardPage.totalPages > 1 ? ` · 第 ${wildcardPage.page}/${wildcardPage.totalPages} 页` : ''}</div>
       </div>
       <div class="table-wrap">
         <table class="wildcard-domain-table">
@@ -1717,7 +2198,7 @@ async function renderDomainsGuide(container) {
           <tbody>
             ${activeGroups.wildcard.length === 0
               ? `<tr><td colspan="3" style="text-align:center;color:var(--text-muted)">暂无通配规则</td></tr>`
-              : activeGroups.wildcard.map(d => `
+              : wildcardPage.data.map(d => `
                 <tr>
                   <td class="domain-rule-cell">
                     <div class="domain-rule-code" title="${escHtml(d.domain)}">${escHtml(d.domain)}</div>
@@ -1732,12 +2213,32 @@ async function renderDomainsGuide(container) {
           </tbody>
         </table>
       </div>
+      ${buildPaginationBar({
+        page: wildcardPage.page,
+        size: wildcardPage.size,
+        total: wildcardPage.total,
+        totalPages: wildcardPage.totalPages,
+        itemLabel: '通配规则',
+        pageSizeOptions: DOMAIN_PAGE_SIZE_OPTIONS,
+        onPageChange: 'setListPage',
+        onPageSizeChange: 'setListPageSize',
+        pagerKey: 'domains-guide-wildcard',
+        compact: true,
+        hideIfSinglePage: true,
+      })}
     </div>
   `;
 
   container.innerHTML = `
     <div class="page-stack page-stack-guide">
       ${summaryCardsHtml}
+      ${buildListFilterBar({
+        key: controlsKey,
+        searchValue: query,
+        searchPlaceholder: '搜索域名或通配规则，例如 example.com',
+        searchButtonLabel: '搜索域名',
+        hint: '支持按精确域名或通配规则关键词筛选当前列表。',
+      })}
       ${pendingHtml}
       <div class="domain-sections-grid">
         ${exactDomainsHtml}
@@ -1805,29 +2306,63 @@ async function renderDomainsGuide(container) {
 // ─── Admin: 账户管理 ─────────────────────────────────────────
 async function renderAdminAccounts(container) {
   const bulkKey = 'admin-accounts';
+  const listKey = 'admin-accounts-list';
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `<button class="btn btn-primary btn-sm" onclick="showCreateAccountModal()">+ 创建账户</button>`;
   }
 
-  const accounts = await api.admin.listAccounts();
-  const deletableAccountIds = (accounts || [])
+  const pagerState = getListViewState(listKey, { page: 1, size: ADMIN_ACCOUNT_PAGE_SIZE, q: '', role: 'all' });
+  const query = String(pagerState.q || '').trim();
+  const role = ['all', 'admin', 'user', 'system'].includes(String(pagerState.role || 'all'))
+    ? String(pagerState.role || 'all')
+    : 'all';
+  const accountPage = await api.admin.listAccountsPage(pagerState.page, pagerState.size, query, role);
+  if (pagerState.page > accountPage.totalPages) {
+    updateListViewState(listKey, { page: accountPage.totalPages }, { page: 1, size: ADMIN_ACCOUNT_PAGE_SIZE, q: '', role: 'all' });
+    return renderAdminAccounts(container);
+  }
+  updateListViewState(listKey, { page: accountPage.page, size: accountPage.size, q: query, role }, { page: 1, size: ADMIN_ACCOUNT_PAGE_SIZE, q: '', role: 'all' });
+
+  const accounts = accountPage.data || [];
+  const deletableAccountIds = accounts
     .filter(a => !a.is_system && !a.is_admin)
     .map(a => a.id);
   setBulkVisibleIds(bulkKey, deletableAccountIds);
   container.innerHTML = `
     <div style="max-width:1240px;display:flex;flex-direction:column;gap:1rem">
+      ${buildListFilterBar({
+        key: listKey,
+        searchValue: query,
+        searchPlaceholder: '搜索用户名或 API Key',
+        searchButtonLabel: '搜索账户',
+        filters: [
+          {
+            field: 'role',
+            label: '角色',
+            value: role,
+            options: [
+              { value: 'all', label: '全部角色' },
+              { value: 'admin', label: '管理员' },
+              { value: 'user', label: '普通用户' },
+              { value: 'system', label: '系统账号' },
+            ],
+          },
+        ],
+        hint: '可按用户名、API Key 或角色筛选账户列表。',
+      })}
       ${deletableAccountIds.length > 0 ? buildBulkToolbar({
         key: bulkKey,
         itemLabel: '可删除账户',
         actions: [
           { value: 'delete', label: '删除选中账户', run: () => window.bulkDeleteAccounts(bulkKey) },
         ],
+        scopeHint: '当前批量操作仅对本页账户生效，翻页后会自动切换到新页面的可见列表。',
       }) : ''}
       <div class="card">
         <div class="card-header">
           <div class="card-title">👥 账户列表</div>
-          <div style="font-size:0.78rem;color:var(--text-muted)">共 ${(accounts||[]).length} 个账户</div>
+          <div style="font-size:0.78rem;color:var(--text-muted)">共 ${accountPage.total} 个账户${accountPage.totalPages > 1 ? ` · 第 ${accountPage.page}/${accountPage.totalPages} 页` : ''}</div>
         </div>
         <div class="table-wrap">
           <table>
@@ -1835,7 +2370,9 @@ async function renderAdminAccounts(container) {
               <tr><th style="width:44px">选择</th><th>用户名</th><th>角色</th><th>永久邮箱额度</th><th>创建时间</th><th>操作</th></tr>
             </thead>
             <tbody>
-              ${(accounts||[]).map(a => `
+              ${accounts.length === 0 ? `
+                <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:1.2rem">没有匹配当前筛选条件的账户</td></tr>
+              ` : accounts.map(a => `
                 <tr>
                   <td style="text-align:center">
                     ${(!a.is_system && !a.is_admin)
@@ -1885,6 +2422,19 @@ async function renderAdminAccounts(container) {
             </tbody>
           </table>
         </div>
+        ${buildPaginationBar({
+          page: accountPage.page,
+          size: accountPage.size,
+          total: accountPage.total,
+          totalPages: accountPage.totalPages,
+          itemLabel: '账户',
+          pageSizeOptions: ADMIN_ACCOUNT_PAGE_SIZE_OPTIONS,
+          onPageChange: 'setListPage',
+          onPageSizeChange: 'setListPageSize',
+          pagerKey: listKey,
+          compact: true,
+          hideIfSinglePage: true,
+        })}
       </div>
     </div>
   `;
@@ -1986,16 +2536,28 @@ window.toggleAccountAdmin = function(id, isAdmin, name) {
 // ─── Admin: Catch-all 收件箱 ─────────────────────────────────
 async function renderAdminCatchall(container) {
   const bulkKey = 'admin-catchall';
+  const listKey = 'admin-catchall-mailboxes';
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `<button class="btn btn-ghost btn-sm" onclick="navigate('admin-settings')">⚙ 调整 Catch-all 设置</button>`;
   }
 
-  const [mailboxes, settings, accounts] = await Promise.all([
-    api.admin.listCatchallMailboxes().catch(() => []),
+  const pagerState = getListViewState(listKey, { page: 1, size: CATCHALL_MAILBOX_PAGE_SIZE, q: '', owner: 'all' });
+  const query = String(pagerState.q || '').trim();
+  const owner = ['all', 'admin', 'user', 'system'].includes(String(pagerState.owner || 'all'))
+    ? String(pagerState.owner || 'all')
+    : 'all';
+  const [mailboxPage, settings, accounts] = await Promise.all([
+    api.admin.listCatchallMailboxesPage(pagerState.page, pagerState.size, query, owner).catch(() => normalizePaginatedResponse([], pagerState.page, pagerState.size)),
     api.admin.getSettings().catch(() => ({})),
-    api.admin.listAccounts().catch(() => []),
+    api.admin.listAllAccounts().catch(() => []),
   ]);
+  if (pagerState.page > mailboxPage.totalPages) {
+    updateListViewState(listKey, { page: mailboxPage.totalPages }, { page: 1, size: CATCHALL_MAILBOX_PAGE_SIZE, q: '', owner: 'all' });
+    return renderAdminCatchall(container);
+  }
+  updateListViewState(listKey, { page: mailboxPage.page, size: mailboxPage.size, q: query, owner }, { page: 1, size: CATCHALL_MAILBOX_PAGE_SIZE, q: '', owner: 'all' });
+  const mailboxes = mailboxPage.data || [];
 
   const policy = settings.unknown_recipient_policy || 'claimable';
   const configuredAdminId = settings.catchall_admin_account_id || '';
@@ -2014,10 +2576,30 @@ async function renderAdminCatchall(container) {
 
   container.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:1rem;max-width:1260px">
+      ${buildListFilterBar({
+        key: listKey,
+        searchValue: query,
+        searchPlaceholder: '搜索地址或归属用户名',
+        searchButtonLabel: '搜索 Catch-all',
+        filters: [
+          {
+            field: 'owner',
+            label: '归属',
+            value: owner,
+            options: [
+              { value: 'all', label: '全部归属' },
+              { value: 'admin', label: '管理员' },
+              { value: 'user', label: '普通用户' },
+              { value: 'system', label: '系统账号' },
+            ],
+          },
+        ],
+        hint: '支持按 Catch-all 地址、归属用户名和归属类型筛选。',
+      })}
       <div class="card">
         <div class="card-header">
           <div class="card-title">📥 Catch-all 收件箱概览</div>
-          <div style="font-size:0.78rem;color:var(--text-muted)">当前共 ${(mailboxes || []).length} 个 catch-all 地址</div>
+          <div style="font-size:0.78rem;color:var(--text-muted)">当前共 ${mailboxPage.total} 个 catch-all 地址${mailboxPage.totalPages > 1 ? ` · 第 ${mailboxPage.page}/${mailboxPage.totalPages} 页` : ''}</div>
         </div>
         <div class="card-body" style="font-size:0.84rem;color:var(--text-secondary);line-height:1.8">
           <div><strong>模式：</strong>${escHtml(policyText)}</div>
@@ -2029,8 +2611,8 @@ async function renderAdminCatchall(container) {
         <div class="card">
           <div class="empty-state">
             <span class="empty-icon">📭</span>
-            <p>当前没有 catch-all 邮箱</p>
-            <p style="margin-top:0.5rem;font-size:0.8rem">当未知地址收到邮件时，这里会自动出现对应地址。</p>
+            <p>${query || owner !== 'all' ? '没有匹配当前筛选条件的 Catch-all 邮箱' : '当前没有 catch-all 邮箱'}</p>
+            <p style="margin-top:0.5rem;font-size:0.8rem">${query || owner !== 'all' ? '请调整搜索词或归属筛选后重试。' : '当未知地址收到邮件时，这里会自动出现对应地址。'}</p>
           </div>
         </div>
       ` : `
@@ -2040,6 +2622,7 @@ async function renderAdminCatchall(container) {
           actions: [
             { value: 'delete', label: '删除选中 Catch-all', run: () => window.bulkDeleteCatchallMailboxes(bulkKey) },
           ],
+          scopeHint: '当前批量操作仅对本页 Catch-all 邮箱生效，翻页后会自动切换到新页面的可见列表。',
         })}
         <div class="card">
           <div class="table-wrap">
@@ -2048,7 +2631,9 @@ async function renderAdminCatchall(container) {
                 <tr><th style="width:44px">选择</th><th>地址</th><th>归属</th><th>邮件数</th><th>最近邮件</th><th>过期时间</th><th>操作</th></tr>
               </thead>
               <tbody>
-                ${mailboxes.map(mb => `
+                ${mailboxes.length === 0 ? `
+                  <tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:1.2rem">没有匹配当前筛选条件的 Catch-all 邮箱</td></tr>
+                ` : mailboxes.map(mb => `
                   <tr>
                     <td style="text-align:center">
                       <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${mb.id}" ${isBulkSelected(bulkKey, mb.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${mb.id}', this.checked)">
@@ -2078,6 +2663,19 @@ async function renderAdminCatchall(container) {
               </tbody>
             </table>
           </div>
+          ${buildPaginationBar({
+            page: mailboxPage.page,
+            size: mailboxPage.size,
+            total: mailboxPage.total,
+            totalPages: mailboxPage.totalPages,
+            itemLabel: 'Catch-all 邮箱',
+            pageSizeOptions: CATCHALL_MAILBOX_PAGE_SIZE_OPTIONS,
+            onPageChange: 'setListPage',
+            onPageSizeChange: 'setListPageSize',
+            pagerKey: listKey,
+            compact: true,
+            hideIfSinglePage: true,
+          })}
         </div>
       `}
     </div>
@@ -2121,6 +2719,7 @@ window.confirmDeleteCatchallMailbox = function(id, addr) {
 // ─── Admin: 域名管理 ─────────────────────────────────────────
 async function renderAdminDomains(container) {
   const bulkKey = 'admin-domains';
+  const controlsKey = 'admin-domains-controls';
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `
@@ -2131,13 +2730,24 @@ async function renderAdminDomains(container) {
   clearPendingDomainPoller();
 
   const domains = await api.domains();
+  const controlState = getListViewState(controlsKey, { page: 1, size: DOMAIN_PAGE_SIZE, q: '' });
+  const query = String(controlState.q || '').trim();
+  const normalizedQuery = query.toLowerCase();
+  const matchDomain = (domain) => !normalizedQuery || String(domain?.domain || '').toLowerCase().includes(normalizedQuery);
   state.adminDomains = domains || [];
-  const pending  = (domains||[]).filter(d => d.status === 'pending');
-  const active   = (domains||[]).filter(d => d.status !== 'pending');
+  const filteredDomains = (domains || []).filter(matchDomain);
+  const pending  = filteredDomains.filter(d => d.status === 'pending');
+  const active   = filteredDomains.filter(d => d.status !== 'pending');
   const activeGroups = splitManagedDomains(active);
   const pendingGroups = splitManagedDomains(pending);
+  const pendingPage = getLocalPageData('admin-domains-pending', pending, DOMAIN_PAGE_SIZE);
+  const exactPage = getLocalPageData('admin-domains-exact', activeGroups.exact, DOMAIN_PAGE_SIZE);
+  const wildcardPage = getLocalPageData('admin-domains-wildcard', activeGroups.wildcard, DOMAIN_PAGE_SIZE);
   const disabledCount = active.filter(d => !d.is_active).length;
-  setBulkVisibleIds(bulkKey, (domains || []).map(d => d.id));
+  setBulkVisibleIds(
+    bulkKey,
+    [...pendingPage.data, ...exactPage.data, ...wildcardPage.data].map(d => d.id),
+  );
 
   const summaryCardsHtml = `
     <div class="stat-grid domain-overview-grid">
@@ -2171,14 +2781,14 @@ async function renderAdminDomains(container) {
           <div class="card-title">🌐 精确域名</div>
           <div class="domain-section-hint">适合根域或单独托管的业务域名</div>
         </div>
-        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.exact.length} 个</div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.exact.length} 个${exactPage.totalPages > 1 ? ` · 第 ${exactPage.page}/${exactPage.totalPages} 页` : ''}</div>
       </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th style="width:44px">选择</th><th>域名</th><th>状态</th><th>操作</th></tr></thead>
           <tbody>
             ${activeGroups.exact.length === 0 ? `<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">暂无精确域名</td></tr>` :
-              activeGroups.exact.map(d => `
+              exactPage.data.map(d => `
                 <tr>
                   <td style="text-align:center">
                     <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${d.id}" ${isBulkSelected(bulkKey, d.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${d.id}', this.checked)">
@@ -2199,6 +2809,19 @@ async function renderAdminDomains(container) {
           </tbody>
         </table>
       </div>
+      ${buildPaginationBar({
+        page: exactPage.page,
+        size: exactPage.size,
+        total: exactPage.total,
+        totalPages: exactPage.totalPages,
+        itemLabel: '精确域名',
+        pageSizeOptions: DOMAIN_PAGE_SIZE_OPTIONS,
+        onPageChange: 'setListPage',
+        onPageSizeChange: 'setListPageSize',
+        pagerKey: 'admin-domains-exact',
+        compact: true,
+        hideIfSinglePage: true,
+      })}
     </div>
   `;
 
@@ -2209,14 +2832,14 @@ async function renderAdminDomains(container) {
           <div class="card-title">✳ 通配子域规则</div>
           <div class="domain-section-hint">例如 <code>*.example.com</code>，适合接收任意子域但不接收根域</div>
         </div>
-        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.wildcard.length} 个</div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${activeGroups.wildcard.length} 个${wildcardPage.totalPages > 1 ? ` · 第 ${wildcardPage.page}/${wildcardPage.totalPages} 页` : ''}</div>
       </div>
       <div class="table-wrap">
         <table class="wildcard-domain-table">
           <thead><tr><th style="width:44px">选择</th><th>规则</th><th>匹配示例</th><th>状态</th><th>操作</th></tr></thead>
           <tbody>
             ${activeGroups.wildcard.length === 0 ? `<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">暂无通配规则</td></tr>` :
-              activeGroups.wildcard.map(d => `
+              wildcardPage.data.map(d => `
                 <tr>
                   <td style="text-align:center">
                     <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${d.id}" ${isBulkSelected(bulkKey, d.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${d.id}', this.checked)">
@@ -2238,12 +2861,32 @@ async function renderAdminDomains(container) {
           </tbody>
         </table>
       </div>
+      ${buildPaginationBar({
+        page: wildcardPage.page,
+        size: wildcardPage.size,
+        total: wildcardPage.total,
+        totalPages: wildcardPage.totalPages,
+        itemLabel: '通配规则',
+        pageSizeOptions: DOMAIN_PAGE_SIZE_OPTIONS,
+        onPageChange: 'setListPage',
+        onPageSizeChange: 'setListPageSize',
+        pagerKey: 'admin-domains-wildcard',
+        compact: true,
+        hideIfSinglePage: true,
+      })}
     </div>
   `;
 
   container.innerHTML = `
     <div class="page-stack page-stack-wide">
-      ${(domains || []).length > 0 ? buildBulkToolbar({
+      ${buildListFilterBar({
+        key: controlsKey,
+        searchValue: query,
+        searchPlaceholder: '搜索域名或通配规则，例如 *.example.com',
+        searchButtonLabel: '搜索域名',
+        hint: '支持按精确域名或通配规则关键词筛选当前管理列表。',
+      })}
+      ${filteredDomains.length > 0 ? buildBulkToolbar({
         key: bulkKey,
         itemLabel: '域名',
         actions: [
@@ -2251,7 +2894,7 @@ async function renderAdminDomains(container) {
           { value: 'disable', label: '停用选中域名', run: () => window.bulkToggleDomains(bulkKey, false) },
           { value: 'delete', label: '删除选中域名', run: () => window.bulkDeleteDomains(bulkKey) },
         ],
-        scopeHint: '当前仅对当前已加载域名生效；启用/停用会自动跳过待验证域名，暂不支持跨页全选。',
+        scopeHint: '当前仅对本页各分区中可见的域名生效；启用/停用会自动跳过待验证域名，翻页后可见范围会更新。',
       }) : ''}
       ${summaryCardsHtml}
       <div class="card" style="border-left:3px solid var(--clr-primary,#b85c38)">
@@ -2263,13 +2906,13 @@ async function renderAdminDomains(container) {
         <div class="card" style="border-left:3px solid var(--clr-warn,#e6a817)">
           <div class="card-header">
             <div class="card-title">🔄 待 MX 验证 (${pending.length})</div>
-            <div style="font-size:0.78rem;color:var(--text-muted)">后台每 30 秒自动检测，验证通过后自动加入域名池</div>
+            <div style="font-size:0.78rem;color:var(--text-muted)">后台每 30 秒自动检测，验证通过后自动加入域名池${pendingPage.totalPages > 1 ? ` · 第 ${pendingPage.page}/${pendingPage.totalPages} 页` : ''}</div>
           </div>
           <div class="table-wrap">
             <table>
               <thead><tr><th style="width:44px">选择</th><th>域名</th><th>类型</th><th>上次检测</th><th>操作</th></tr></thead>
               <tbody id="pending-domains-tbody">
-                ${pending.map(d => `
+                ${pendingPage.data.map(d => `
                   <tr id="pending-row-${d.id}">
                     <td style="text-align:center">
                       <input type="checkbox" data-bulk-key="${bulkKey}" data-bulk-id="${d.id}" ${isBulkSelected(bulkKey, d.id) ? 'checked' : ''} onchange="toggleBulkSelection('${bulkKey}','${d.id}', this.checked)">
@@ -2286,6 +2929,19 @@ async function renderAdminDomains(container) {
               </tbody>
             </table>
           </div>
+          ${buildPaginationBar({
+            page: pendingPage.page,
+            size: pendingPage.size,
+            total: pendingPage.total,
+            totalPages: pendingPage.totalPages,
+            itemLabel: '待验证域名',
+            pageSizeOptions: DOMAIN_PAGE_SIZE_OPTIONS,
+            onPageChange: 'setListPage',
+            onPageSizeChange: 'setListPageSize',
+            pagerKey: 'admin-domains-pending',
+            compact: true,
+            hideIfSinglePage: true,
+          })}
         </div>
       ` : ''}
 
@@ -2530,11 +3186,11 @@ async function renderAdminSettings(container) {
   try {
     [settings, accounts] = await Promise.all([
       api.admin.getSettings(),
-      api.admin.listAccounts(),
+      api.admin.listAllAccounts(),
     ]);
   } catch {
     try { settings = await api.admin.getSettings(); } catch {}
-    try { accounts = await api.admin.listAccounts(); } catch {}
+    try { accounts = await api.admin.listAllAccounts(); } catch {}
   }
 
   const regOpen    = settings.registration_open === 'true' || settings.registration_open === true;
